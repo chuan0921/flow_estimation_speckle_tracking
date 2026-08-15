@@ -1,0 +1,13 @@
+# Pipeline output: CSVs and figures written by main() / plot_roi_peak_3x3.py
+results/
+
+# MATLAB
+*.asv
+*.autosave
+slprj/
+codegen/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
