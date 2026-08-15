@@ -11,3 +11,6 @@ codegen/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+
+# Editor-local settings
+.vscode/

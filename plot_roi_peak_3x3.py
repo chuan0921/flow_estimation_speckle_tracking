@@ -24,7 +24,6 @@ import argparse
 import os
 import re
 
-import h5py
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -59,14 +58,33 @@ PAD_TILE = 0.60     # frame padding around the 3x3 block, in tile pitches
 
 
 def read_slice_centre(slice_file):
-    """Return (xc, zc) in metres from a v7.3 (HDF5) or older .mat file."""
+    """Return (xc, zc) in metres from a v7.3 (HDF5) or older .mat file.
+
+    h5py is imported lazily: environments without it can still render by
+    passing --xc/--zc, which is all this function is here to supply.
+    """
     try:
-        with h5py.File(slice_file, "r") as f:
-            return float(np.array(f["xc"]).ravel()[0]), float(np.array(f["zc"]).ravel()[0])
-    except OSError:
-        from scipy.io import loadmat
+        import h5py
+    except ImportError:
+        h5py = None
+
+    if h5py is not None:
+        try:
+            with h5py.File(slice_file, "r") as f:
+                return (float(np.array(f["xc"]).ravel()[0]),
+                        float(np.array(f["zc"]).ravel()[0]))
+        except OSError:
+            pass                      # not HDF5 -> fall through to scipy
+
+    from scipy.io import loadmat
+    try:
         m = loadmat(slice_file, variable_names=["xc", "zc"])
-        return float(np.ravel(m["xc"])[0]), float(np.ravel(m["zc"])[0])
+    except NotImplementedError:
+        raise SystemExit(
+            f"{slice_file} is a MATLAB v7.3 file, which needs h5py to read.\n"
+            "Either install h5py in this environment, or pass the slice "
+            "centre directly with --xc <metres> --zc <metres>.")
+    return float(np.ravel(m["xc"])[0]), float(np.ravel(m["zc"])[0])
 
 
 def pick_3x3(d, ux, uz, target):
@@ -155,7 +173,12 @@ def draw_one(d, idx, dx, dz, lim, out_png, title):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--csv", required=True)
-    ap.add_argument("--slice", required=True)
+    ap.add_argument("--slice", default="",
+                    help="slice .mat supplying xc/zc; optional if --xc/--zc given")
+    ap.add_argument("--xc", type=float, default=None,
+                    help="slice centre x [m], overrides the .mat")
+    ap.add_argument("--zc", type=float, default=None,
+                    help="slice centre z [m], overrides the .mat")
     ap.add_argument("--outdir", default="")
     ap.add_argument("--prefix", default="")
     ap.add_argument("--title-prefix", default="")
@@ -176,7 +199,12 @@ def main():
     if missing:
         raise SystemExit(f"CSV is missing required column(s): {', '.join(missing)}")
 
-    xc, zc = read_slice_centre(args.slice)
+    if args.xc is not None and args.zc is not None:
+        xc, zc = args.xc, args.zc
+    elif args.slice:
+        xc, zc = read_slice_centre(args.slice)
+    else:
+        raise SystemExit("give either --slice <file.mat> or both --xc and --zc")
     d["x"] = d["x_mm"] + xc * 1e3
     d["z"] = d["z_mm"] + zc * 1e3
     d["xr"] = d["x"].round(6)
