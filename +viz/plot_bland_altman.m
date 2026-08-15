@@ -12,6 +12,7 @@ function [fig, ax] = plot_bland_altman(P, varargin)
 %
 % Name-value options
 %   Title         ''     figure title prefix
+%   EstimateColumn 'Vy_mms' table column used as the estimate
 %   HideOutliers  true   drop rows flagged by the normalized median test
 %   Relative      false  plot the difference as a percentage of the mean
 %
@@ -20,12 +21,19 @@ function [fig, ax] = plot_bland_altman(P, varargin)
 p = inputParser;
 p.FunctionName = 'viz.plot_bland_altman';
 p.addParameter('Title', '', @(v) ischar(v) || isstring(v));
+p.addParameter('EstimateColumn', 'Vy_mms', @(v) ischar(v) || isstring(v));
 p.addParameter('HideOutliers', true, @(v) islogical(v) && isscalar(v));
 p.addParameter('Relative', false, @(v) islogical(v) && isscalar(v));
 p.parse(varargin{:});
 o = p.Results;
+estimateColumn = char(o.EstimateColumn);
+if ~ismember(estimateColumn, P.Properties.VariableNames)
+    error('viz:plot_bland_altman:missingColumn', ...
+        'P does not contain estimate column %s.', estimateColumn);
+end
 
-m = isfinite(P.Vy_mms) & isfinite(P.VyTrue_mms);
+estimate = P.(estimateColumn);
+m = isfinite(estimate) & isfinite(P.VyTrue_mms);
 if o.HideOutliers && ismember('outlier', P.Properties.VariableNames)
     m = m & ~P.outlier;
 end
@@ -34,8 +42,9 @@ if isempty(P)
     error('viz:plot_bland_altman:noPoints', 'No finite paired points in P.');
 end
 
-avg = (P.Vy_mms + P.VyTrue_mms) / 2;
-dif = P.Vy_mms - P.VyTrue_mms;
+estimate = P.(estimateColumn);
+avg = (estimate + P.VyTrue_mms) / 2;
+dif = estimate - P.VyTrue_mms;
 unit = 'mm/s';
 if o.Relative
     ref = avg;
@@ -57,7 +66,7 @@ C = lines(max(numel(names), 3));
 
 fig = figure('Color', 'w', 'Name', 'Bland-Altman', ...
     'Position', [100 100 720 520]);
-ax = axes(fig); %#ok<LAXES>
+ax = axes(fig);
 hold(ax, 'on');
 
 h = gobjects(1, numel(names));

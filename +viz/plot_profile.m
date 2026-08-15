@@ -1,78 +1,71 @@
 function [fig, ax] = plot_profile(prof, varargin)
-%PLOT_PROFILE Radial blood-flow velocity profile: raw, SG-filtered, truth.
+%PLOT_PROFILE Blood-flow velocity along one vessel-centre diameter.
 %
 %   viz.plot_profile(prof)
-%   viz.plot_profile(prof, 'Title', 'sim_v080cms')
+%   viz.plot_profile(prof, 'Title', 'sim_stenosis50_80cms')
 %
-% prof is the profile table written by main (profile.csv). Every slice
-% shares the same radial lattice, so the slices are overlaid as faint points
-% and summarised by the across-slice mean with a +/-1 std band. The analytic
-% or CFD truth is drawn on top as a dashed reference.
-%
-% Name-value options
-%   Title    ''      figure title prefix
-%   Band     true    shade the +/-1 std across-slice spread
-%
-% Returns the figure and axes handles.
+% prof is one slice from profile.csv. Its signed diameter_pos_mm coordinate
+% runs from the left wall (-R), through the centre (0), to the right wall
+% (+R). The wall endpoints are exact no-slip constraints.
 
 p = inputParser;
 p.FunctionName = 'viz.plot_profile';
 p.addParameter('Title', '', @(v) ischar(v) || isstring(v));
-p.addParameter('Band', true, @(v) islogical(v) && isscalar(v));
 p.parse(varargin{:});
 o = p.Results;
 
-[r, raw_m, raw_s] = collapse(prof, 'vy_raw');
-[~, sg_m] = collapse(prof, 'vy_sg');
-[~, tru_m] = collapse(prof, 'vy_true');
-
-fig = figure('Color', 'w', 'Name', 'radial velocity profile', ...
-    'Position', [100 100 720 480]);
-ax = axes(fig); %#ok<LAXES>
-hold(ax, 'on');
-
-h = gobjects(1, 0);
-lbl = {};
-
-% Individual slices, so the reader can see the spread the band summarises.
-sc = scatter(ax, prof.r_mm, prof.vy_raw, 8, [0.7 0.75 0.82], 'filled');
-sc.MarkerFaceAlpha = 0.45;
-h(end + 1) = sc;
-lbl{end + 1} = 'per-slice raw';
-
-if o.Band && any(isfinite(raw_s))
-    ok = isfinite(raw_m) & isfinite(raw_s);
-    fill(ax, [r(ok); flipud(r(ok))], ...
-        [raw_m(ok) - raw_s(ok); flipud(raw_m(ok) + raw_s(ok))], ...
-        [0.20 0.45 0.75], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
+if ~ismember('diameter_pos_mm', prof.Properties.VariableNames)
+    error('viz:plot_profile:legacyRadialProfile', ...
+        'profile.csv is radial. Re-run main to create a diameter BFVP.');
 end
+if numel(unique(prof.slice_idx)) ~= 1
+    error('viz:plot_profile:oneSlice', ...
+        'A BFVP is slice-specific; pass exactly one slice.');
+end
+if ismember('seed_base', prof.Properties.VariableNames)
+    prof = prof(prof.seed_base == min(prof.seed_base), :);
+end
+prof = sortrows(prof, 'diameter_pos_mm');
+x = prof.diameter_pos_mm;
 
-h(end + 1) = plot(ax, r, raw_m, '-o', 'Color', [0.20 0.45 0.75], ...
-    'LineWidth', 1.4, 'MarkerSize', 3.5, 'MarkerFaceColor', [0.20 0.45 0.75]);
-lbl{end + 1} = 'raw (mean over slices)';
+fig = figure('Color', 'w', 'Name', 'diameter BFVP', ...
+    'Position', [100 100 900 620]);
+ax = axes(fig);
+hold(ax, 'on');
+xline(ax, 0, ':', 'Vessel centre', 'Color', [0.35 0.35 0.35], ...
+    'LineWidth', 1.2, 'LabelVerticalAlignment', 'bottom');
 
-h(end + 1) = plot(ax, r, sg_m, '-', 'Color', [0.85 0.33 0.10], 'LineWidth', 2);
-lbl{end + 1} = 'Savitzky-Golay';
+hRaw = scatter(ax, x, prof.vy_raw, 58, [0.20 0.45 0.75], 'filled', ...
+    'MarkerEdgeColor', 'w', 'LineWidth', 0.6);
+hFill = plot(ax, x, prof.vy_fill, '--', 'Color', [0.20 0.45 0.75], ...
+    'LineWidth', 1.8);
+hSg = plot(ax, x, prof.vy_sg, '-', 'Color', [0.85 0.33 0.10], ...
+    'LineWidth', 2.6);
+hTruth = plot(ax, x, prof.vy_true, '--k', 'LineWidth', 2.2);
 
-h(end + 1) = plot(ax, r, tru_m, '--k', 'LineWidth', 1.6);
-lbl{end + 1} = 'truth';
-
+radius = max(abs(x), [], 'omitnan');
+xlim(ax, [-radius radius]);
 hold(ax, 'off');
 grid(ax, 'on');
 box(ax, 'on');
-xlabel(ax, 'radial position r [mm]');
-ylabel(ax, 'v_y [mm/s]');
-legend(ax, h, lbl, 'Location', 'southwest', 'Box', 'off');
-title(ax, strtrim(sprintf('%s  blood flow velocity profile (%d slices)', ...
-    char(o.Title), numel(unique(prof.slice_idx)))), 'Interpreter', 'none');
+set(ax, 'FontSize', 14);
+xlabel(ax, 'Position along centre diameter x [mm]', 'FontSize', 18);
+ylabel(ax, 'Through-plane velocity v_y [mm/s]', 'FontSize', 18);
+legend(ax, [hRaw hFill hSg hTruth], ...
+    {'Raw ROI estimate', 'No-slip interpolation', ...
+    'Estimate after 2-D SG', 'CFD truth'}, ...
+    'Location', 'best', 'Box', 'off', 'FontSize', 13);
+
+region = '';
+if ismember('vessel_region', prof.Properties.VariableNames)
+    region = char(prof.vessel_region(1));
 end
-
-
-function [r, m, s] = collapse(prof, col)
-%COLLAPSE Across-slice mean and std at each radius.
-[r, ~, g] = unique(round(prof.r_mm, 6));
-v = prof.(col);
-m = accumarray(g, v, [], @(x) mean(x, 'omitnan'));
-s = accumarray(g, v, [], @(x) std(x, 'omitnan'));
-m(accumarray(g, double(isfinite(v)), [], @sum) == 0) = nan;
+if isempty(region)
+    secondLine = 'Diameter BFVP';
+else
+    secondLine = sprintf('%s | Diameter BFVP', region);
+end
+ttl = sprintf('%s | Slice %d (y = %.1f mm)\n%s', ...
+    char(o.Title), prof.slice_idx(1), prof.slice_pos_mm(1), secondLine);
+title(ax, strtrim(ttl), 'Interpreter', 'none', 'FontSize', 18);
 end

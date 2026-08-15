@@ -23,7 +23,13 @@ if ~any(isfinite(r_path))
 end
 R_loc = min(r_path, [], 'omitnan');
 
-gv = -d.R:opts.grid_step:d.R;
+% Anchor the lattice on the vessel axis, not on -R: with -R:step:R the
+% sequence only passes through 0 when R is an exact multiple of step, so a
+% general R leaves no sample on the axis and shifts the whole lattice
+% off-centre by up to half a step. Nothing is lost at the rim because keep
+% drops everything outside 0.9*R_loc anyway.
+k = floor(d.R / opts.grid_step);
+gv = (-k:k) * opts.grid_step;
 [GX, GZ] = meshgrid(gv, gv);
 keep = (GX.^2 + GZ.^2) <= (0.9 * R_loc)^2;
 grid_x = GX(keep) + d.xc;

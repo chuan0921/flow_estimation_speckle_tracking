@@ -4,6 +4,7 @@ function S = main(data_root, varargin)
 %   S = main('/home/chihyu/psf_sim/data')
 %   S = main(root, 'Slices', 1:4:41)          % subsample, fast pass
 %   S = main(root, 'Datasets', {'sim_v020cms'})
+%   S = main(root, 'Seeds', [100 200 300])
 %   S = main(root, 'Opts', struct('grid_step', 0.5e-3))
 %   S = main(root, 'Figures', false)          % CSVs only
 %
@@ -13,21 +14,21 @@ function S = main(data_root, varargin)
 % a _summary/ folder comparing the conditions.
 %
 % Per dataset:
-%   points.csv         one row per grid point per slice (raw estimates)
-%   profile.csv        radial profile per slice: raw mean, SG-filtered, truth
-%   metrics_slice.csv  one row per slice
+%   points.csv              one row per grid point per slice and seed
+%   field.csv               reconstructed full lumen plus no-slip wall
+%   profile.csv             centre-diameter BFVP per slice and seed
+%   metrics_seed_slice.csv  one row per independently estimated seed/slice
+%   metrics_slice.csv       one row per slice, aggregated across seeds
 %   metrics.csv        one row: slice metrics averaged over the vessel
 %   figures/
 %
-% Metrics. The lattice is identical on every slice, so radii line up and the
-% analysis works at two levels, as requested:
-%   per slice    RMSE_s and NRMSE_s = RMSE_s / mean(VyTrue_s)
-%   per vessel   mean over slices, with the spread across slices as the std
-% RMSE is reported on three bases so raw and filtered are comparable:
-%   *_pt   over individual grid points
-%   *_raw  over the per-radius profile means
-%   *_sg   over the Savitzky-Golay filtered profile
-% std_mms is the standard deviation of the point-level residual.
+% Seed files are discovered beside each manifest file. The unsuffixed file
+% and any slice_XXX_sNNN.mat files are independent realisations. Each is
+% estimated and scored separately; only then are metrics averaged across
+% seeds. A single available seed therefore follows exactly the same path.
+%
+% Metrics compare the raw and 2-D Savitzky-Golay estimates point by point on
+% the same valid ROI mask. NRMSE = RMSE / mean(VyTrue) for that seed/slice.
 %
 % Lag range. The stock defaults in src.default_opts target a much longer,
 % faster acquisition. With 'AutoLags' (default true) the scan range is
@@ -48,13 +49,14 @@ p = inputParser;
 p.FunctionName = 'main';
 p.addParameter('Datasets', {}, @(v) iscellstr(v) || isstring(v) || ischar(v));
 p.addParameter('Slices', [], @(v) isempty(v) || isnumeric(v));
+p.addParameter('Seeds', 'auto', @valid_seeds);
 p.addParameter('Opts', struct(), @isstruct);
 p.addParameter('Phantom', [], @(v) isempty(v) || isstruct(v));
 p.addParameter('ResultsDir', fullfile(root, 'results'), @(v) ischar(v) || isstring(v));
 p.addParameter('Figures', true, @(v) islogical(v) && isscalar(v));
 p.addParameter('AutoLags', true, @(v) islogical(v) && isscalar(v));
-p.addParameter('SGOrder', 3, @(v) isnumeric(v) && isscalar(v) && v >= 1);
-p.addParameter('SGWindow', 11, @(v) isnumeric(v) && isscalar(v) && v >= 3);
+p.addParameter('SGOrder', 2, @(v) isnumeric(v) && isscalar(v) && v >= 1);
+p.addParameter('SGWindow', 5, @(v) isnumeric(v) && isscalar(v) && v >= 3);
 p.addParameter('ProfileStep', 0.05, @(v) isnumeric(v) && isscalar(v) && v > 0);
 p.parse(varargin{:});
 o = p.Results;
@@ -75,9 +77,12 @@ if o.Figures
 end
 
 allPoints = {};
+allField = {};
 allProfile = {};
+allSeedSlice = {};
 allSlice = {};
 allMetrics = {};
+allRegions = {};
 
 for ds = 1:numel(sets)
     name = sets(ds).name;
@@ -88,47 +93,78 @@ for ds = 1:numel(sets)
     M = readtable(fullfile(sets(ds).path, 'manifest.csv'));
     files = resolve_files(M, sets(ds).path);
     pick = select_slices(height(M), o.Slices);
-    opts = dataset_opts(files{pick(1)}, o);
-
-    pts = cell(1, numel(pick));
-    t0 = tic;
-    for k = 1:numel(pick)
-        i = pick(k);
-        Ti = src.estimate_slice(files{i}, o.Phantom, opts);
-        Ti.dataset = repmat(string(name), height(Ti), 1);
-        Ti.slice_idx = repmat(M.slice_idx(i), height(Ti), 1);
-        Ti.slice_pos_mm = repmat(M.slice_pos_mm(i), height(Ti), 1);
-        pts{k} = Ti;
-        fprintf('  slice %3d (%+6.1f mm)  %3d/%3d valid\n', M.slice_idx(i), ...
-            M.slice_pos_mm(i), nnz(isfinite(Ti.Vy_mms)), height(Ti));
+    jobs = discover_seed_jobs(M, files, pick, o.Seeds);
+    if isempty(jobs)
+        error('main:noSeedFiles', ...
+            'No files matched the requested seeds for dataset %s.', name);
     end
-    P = movevars(vertcat(pts{:}), {'dataset', 'slice_idx', 'slice_pos_mm'}, ...
-        'Before', 1);
-    fprintf('  %d slices in %.0f s\n', numel(pick), toc(t0));
+    opts = dataset_opts(char(jobs.file(1)), o);
+    phantom = dataset_phantom(name, sets(ds).path, char(jobs.file(1)), o.Phantom);
+    regions = build_vessel_regions(M, char(jobs.file(1)), phantom, opts);
 
-    prof = build_profile(P, o.SGOrder, o.SGWindow, ...
-        slice_R(files{pick(1)}), o.ProfileStep);
-    msl = slice_metrics(P, prof);
-    met = vessel_metrics(msl, name, slice_vmax(files{pick(1)}));
+    pts = cell(1, height(jobs));
+    t0 = tic;
+    for k = 1:height(jobs)
+        Ti = src.estimate_slice(char(jobs.file(k)), phantom, opts);
+        ir = find(regions.slice_idx == jobs.slice_idx(k), 1);
+        Ti.dataset = repmat(string(name), height(Ti), 1);
+        Ti.slice_idx = repmat(jobs.slice_idx(k), height(Ti), 1);
+        Ti.slice_pos_mm = repmat(jobs.slice_pos_mm(k), height(Ti), 1);
+        Ti.seed_base = repmat(jobs.seed_base(k), height(Ti), 1);
+        Ti.slice_seed = repmat(jobs.slice_seed(k), height(Ti), 1);
+        Ti.lumen_radius_mm = repmat(regions.lumen_radius_mm(ir), height(Ti), 1);
+        Ti.radius_ratio = repmat(regions.radius_ratio(ir), height(Ti), 1);
+        Ti.truth_inplane_ratio = repmat(regions.truth_inplane_ratio(ir), height(Ti), 1);
+        Ti.truth_asymmetry = repmat(regions.truth_asymmetry(ir), height(Ti), 1);
+        Ti.truth_reverse_frac = repmat(regions.truth_reverse_frac(ir), height(Ti), 1);
+        Ti.truth_disturbance = repmat(regions.truth_disturbance(ir), height(Ti), 1);
+        Ti.vessel_region = repmat(regions.vessel_region(ir), height(Ti), 1);
+        pts{k} = Ti;
+        fprintf('  slice %3d seed %4g (%+6.1f mm)  %3d/%3d valid\n', ...
+            jobs.slice_idx(k), jobs.seed_base(k), jobs.slice_pos_mm(k), ...
+            nnz(isfinite(Ti.Vy_mms)), height(Ti));
+    end
+    P = movevars(vertcat(pts{:}), ...
+        {'dataset', 'slice_idx', 'slice_pos_mm', 'seed_base', 'slice_seed', ...
+        'vessel_region', 'lumen_radius_mm', 'radius_ratio'}, ...
+        'Before', 1);
+    [P, F] = reconstruct_lumen(P, o.SGOrder, o.SGWindow, ...
+        phantom, char(jobs.file(1)), opts);
+    fprintf('  %d slice/seed run(s), %d slice(s), in %.0f s\n', ...
+        height(jobs), numel(unique(jobs.slice_idx)), toc(t0));
+
+    prof = build_profile(F);
+    mseed = seed_slice_metrics(P, F);
+    msl = aggregate_seed_metrics(mseed);
+    met = vessel_metrics(msl, name, slice_vmax(char(jobs.file(1))));
 
     writetable(P, fullfile(outDir, 'points.csv'));
+    writetable(F, fullfile(outDir, 'field.csv'));
     writetable(prof, fullfile(outDir, 'profile.csv'));
+    writetable(regions, fullfile(outDir, 'vessel_regions.csv'));
+    writetable(mseed, fullfile(outDir, 'metrics_seed_slice.csv'));
     writetable(msl, fullfile(outDir, 'metrics_slice.csv'));
     writetable(met, fullfile(outDir, 'metrics.csv'));
 
     if o.Figures
         figDir = fullfile(outDir, 'figures');
         ensure_dir(figDir);
-        save_fig(viz.plot_profile(prof, 'Title', name), ...
-            fullfile(figDir, 'profile.png'));
-        save_fig(viz.plot_error_vs_radius(prof, 'Title', name), ...
-            fullfile(figDir, 'error_vs_radius.png'));
-        save_fig(viz.plot_metrics_vs_slice(msl, 'Title', name), ...
-            fullfile(figDir, 'metrics_vs_slice.png'));
-        save_fig(viz.plot_cc_peak_map(P, 'Title', name), ...
+        Pfig = representative_seed_points(P);
+        Ffig = representative_seed_points(F);
+        bfvpDir = fullfile(figDir, 'bfvp');
+        ensure_dir(bfvpDir);
+        slicesFig = unique(Ffig.slice_idx, 'stable');
+        for is = 1:numel(slicesFig)
+            profFig = build_profile(Ffig(Ffig.slice_idx == slicesFig(is), :));
+            save_fig(viz.plot_profile(profFig, 'Title', name), ...
+                fullfile(bfvpDir, sprintf('slice_%03d.png', slicesFig(is))));
+        end
+        save_fig(viz.plot_metrics_vs_slice(msl, 'Title', name, ...
+            'Regions', regions), fullfile(figDir, 'vessel_summary.png'));
+        save_fig(viz.plot_cc_peak_map(Pfig, 'Title', name), ...
             fullfile(figDir, 'cc_peak_map.png'));
         mid = pick(ceil(numel(pick) / 2));
-        Tm = P(P.slice_idx == M.slice_idx(mid), :);
+        Tm = Pfig(Pfig.slice_idx == M.slice_idx(mid), :);
         if any(isfinite(Tm.Vy_mms))
             save_fig(viz.plot_vector_field(Tm, 'Truth', true), ...
                 fullfile(figDir, 'vector_field.png'));
@@ -136,32 +172,51 @@ for ds = 1:numel(sets)
     end
 
     allPoints{end + 1} = P;      %#ok<AGROW>
+    allField{end + 1} = F;       %#ok<AGROW>
     allProfile{end + 1} = prof;  %#ok<AGROW>
+    allSeedSlice{end + 1} = mseed; %#ok<AGROW>
     allSlice{end + 1} = msl;     %#ok<AGROW>
     allMetrics{end + 1} = met;   %#ok<AGROW>
+    allRegions{end + 1} = add_dataset(regions, name); %#ok<AGROW>
 end
 
 S.points = vertcat(allPoints{:});
+S.field = vertcat(allField{:});
 S.profile = vertcat(allProfile{:});
+S.metrics_seed_slice = vertcat(allSeedSlice{:});
 S.metrics_slice = vertcat(allSlice{:});
 S.metrics = vertcat(allMetrics{:});
+S.regions = vertcat(allRegions{:});
 
 sumDir = fullfile(o.ResultsDir, '_summary');
 ensure_dir(sumDir);
 writetable(S.metrics, fullfile(sumDir, 'metrics_all.csv'));
+writetable(S.metrics_seed_slice, fullfile(sumDir, 'metrics_seed_slice_all.csv'));
 writetable(S.metrics_slice, fullfile(sumDir, 'metrics_slice_all.csv'));
+writetable(S.regions, fullfile(sumDir, 'vessel_regions_all.csv'));
 
 if o.Figures
     figDir = fullfile(sumDir, 'figures');
     ensure_dir(figDir);
-    save_fig(viz.plot_nrmse_vs_speed(S.metrics_slice), ...
-        fullfile(figDir, 'nrmse_vs_speed.png'));
+    names = unique(S.metrics_slice.dataset, 'stable');
+    for k = 1:numel(names)
+        Q = S.metrics_slice(S.metrics_slice.dataset == names(k), :);
+        R = S.regions(S.regions.dataset == names(k), :);
+        save_fig(viz.plot_metrics_vs_slice(Q, 'Title', names(k), ...
+            'Regions', R), fullfile(figDir, ...
+            sprintf('%s_vessel_summary.png', char(names(k)))));
+    end
     save_fig(viz.plot_valid_fraction(S.metrics_slice), ...
         fullfile(figDir, 'valid_fraction.png'));
-    save_fig(viz.plot_est_vs_true(S.points), ...
+    Pfig = representative_seed_points(S.points);
+    save_fig(viz.plot_est_vs_true(Pfig), ...
         fullfile(figDir, 'est_vs_true.png'));
-    save_fig(viz.plot_bland_altman(S.points), ...
-        fullfile(figDir, 'bland_altman.png'));
+    save_fig(viz.plot_bland_altman(Pfig, ...
+        'EstimateColumn', 'Vy_raw_mms', 'Title', 'Raw'), ...
+        fullfile(figDir, 'bland_altman_raw.png'));
+    save_fig(viz.plot_bland_altman(Pfig, ...
+        'EstimateColumn', 'Vy_sg_mms', 'Title', 'After SG (2-D)'), ...
+        fullfile(figDir, 'bland_altman_sg.png'));
 end
 
 fprintf('\nmain: results in %s\n', o.ResultsDir);
@@ -220,6 +275,101 @@ end
 end
 
 
+function tf = valid_seeds(v)
+tf = isempty(v) || isnumeric(v) || ...
+    ((ischar(v) || (isstring(v) && isscalar(v))) && strcmpi(string(v), "auto"));
+if isnumeric(v)
+    tf = tf && isvector(v) && all(isfinite(v)) && all(v >= 0) && ...
+        all(mod(v, 1) == 0);
+end
+end
+
+
+function jobs = discover_seed_jobs(M, files, pick, want)
+%DISCOVER_SEED_JOBS Expand each manifest slice into its available seeds.
+% seed_base stored inside the MAT file is authoritative. Filename suffixes
+% are only a fallback for older partial generations.
+file = strings(0, 1);
+manifest_row = zeros(0, 1);
+slice_idx = zeros(0, 1);
+slice_pos_mm = zeros(0, 1);
+seed_base = zeros(0, 1);
+slice_seed = zeros(0, 1);
+
+for kk = 1:numel(pick)
+    i = pick(kk);
+    base_file = files{i};
+    [folder, stem, ext] = fileparts(base_file);
+    candidates = string(base_file);
+    extra = dir(fullfile(folder, [stem '_s*' ext]));
+    if ~isempty(extra)
+        candidates = [candidates; string(fullfile({extra.folder}, {extra.name})).']; %#ok<AGROW>
+    end
+
+    seen = zeros(0, 1);
+    for j = 1:numel(candidates)
+        [sb, ss] = file_seed(char(candidates(j)), M.slice_idx(i));
+        if ~seed_requested(sb, want)
+            continue;
+        end
+        if ismember(sb, seen)
+            warning('main:duplicateSeed', ...
+                'Ignoring duplicate slice %d seed %g file %s.', ...
+                M.slice_idx(i), sb, candidates(j));
+            continue;
+        end
+        seen(end + 1, 1) = sb; %#ok<AGROW>
+        file(end + 1, 1) = candidates(j); %#ok<AGROW>
+        manifest_row(end + 1, 1) = i; %#ok<AGROW>
+        slice_idx(end + 1, 1) = M.slice_idx(i); %#ok<AGROW>
+        slice_pos_mm(end + 1, 1) = M.slice_pos_mm(i); %#ok<AGROW>
+        seed_base(end + 1, 1) = sb; %#ok<AGROW>
+        slice_seed(end + 1, 1) = ss; %#ok<AGROW>
+    end
+end
+
+jobs = table(file, manifest_row, slice_idx, slice_pos_mm, seed_base, slice_seed);
+if ~isempty(jobs)
+    jobs = sortrows(jobs, {'manifest_row', 'seed_base'});
+end
+end
+
+
+function [seed_base, slice_seed] = file_seed(file, slice_idx)
+s = load(file, 'seed_base', 'slice_seed');
+if isfield(s, 'seed_base') && isscalar(s.seed_base) && isfinite(s.seed_base)
+    seed_base = double(s.seed_base);
+else
+    [~, stem] = fileparts(file);
+    tok = regexp(stem, '_s(\d+)$', 'tokens', 'once');
+    if ~isempty(tok)
+        seed_base = str2double(tok{1});
+    elseif isfield(s, 'slice_seed') && isscalar(s.slice_seed) && ...
+            isfinite(s.slice_seed)
+        seed_base = double(s.slice_seed) - slice_idx;
+    else
+        seed_base = 0;
+        warning('main:legacySeed', ...
+            'No seed metadata in %s; using seed_base=0.', file);
+    end
+end
+if isfield(s, 'slice_seed') && isscalar(s.slice_seed) && isfinite(s.slice_seed)
+    slice_seed = double(s.slice_seed);
+else
+    slice_seed = seed_base + slice_idx;
+end
+end
+
+
+function tf = seed_requested(seed_base, want)
+if isempty(want) || ischar(want) || isstring(want)
+    tf = true;
+else
+    tf = ismember(seed_base, want);
+end
+end
+
+
 function pick = select_slices(n, want)
 if isempty(want)
     pick = 1:n;
@@ -269,279 +419,641 @@ end
 end
 
 
-function r = slice_R(f)
-%SLICE_R Vessel radius [mm]; the no-slip anchor sits here.
-s = load(f, 'R');
-if isfield(s, 'R')
-    r = s.R * 1e3;
-else
-    r = nan;
+function ph = dataset_phantom(name, dsPath, sample_file, supplied)
+%DATASET_PHANTOM Use CFD truth automatically for stenosis simulations.
+if ~isempty(supplied)
+    if isfield(supplied, 'wall_radius') && isfield(supplied, 'velocity')
+        ph = supplied;
+    else
+        ph = src.phantom_cfd(supplied);
+    end
+    return;
 end
+
+tok = regexp(char(name), '^sim_stenosis(\d*)_?(\d+)cms', 'tokens', 'once');
+if ~isempty(tok)
+    degree = tok{1};
+    if isempty(degree)
+        degree = '50';
+    end
+    psf_root = fileparts(fileparts(dsPath));
+    cfd_file = fullfile(psf_root, 'CFD_input', ...
+        sprintf('%s_vessel_Vcenter_%scm_s', degree, tok{2}), ...
+        'cfd_flow_grid.mat');
+    if ~isfile(cfd_file)
+        error('main:missingCFD', ...
+            'Stenosis dataset %s requires CFD truth: %s', name, cfd_file);
+    end
+    fprintf('  truth: %s\n', cfd_file);
+    ph = src.phantom_cfd(load(cfd_file));
+else
+    d = load(sample_file, 'R', 'vmax', 'flow_direction');
+    ph = src.phantom_parabolic(d);
+end
+end
+
+
+function regions = build_vessel_regions(M, sample_file, ph, opts)
+%BUILD_VESSEL_REGIONS Classify the full vessel from geometry and CFD truth.
+d = load(sample_file, 'R', 'd_row');
+opts = src.default_opts(opts);
+n = height(M);
+radius = nan(n, 1);
+ipRatio = nan(n, 1);
+asymmetry = nan(n, 1);
+reverseFrac = nan(n, 1);
+
+kmax = floor(d.R / opts.grid_step);
+gv = (-kmax:kmax) * opts.grid_step;
+[GX, GZ] = meshgrid(gv, gv);
+
+for k = 1:n
+    y0 = M.slice_pos_mm(k) * 1e-3;
+    ysp = linspace(y0 - d.d_row / 2, y0 + d.d_row / 2, 5);
+    rpath = ph.wall_radius(ysp);
+    radius(k) = min(rpath, [], 'omitnan') * 1e3;
+    keep = hypot(GX, GZ) <= 0.9 * radius(k) * 1e-3;
+    xq = GX(keep);
+    zq = GZ(keep);
+    Xq = repmat(xq, 1, numel(ysp));
+    Zq = repmat(zq, 1, numel(ysp));
+    Yq = repmat(ysp, numel(xq), 1);
+    [ux, uy, uz] = ph.velocity(Xq, Yq, Zq);
+    ux = mean(ux, 2);
+    uy = mean(uy, 2);
+    uz = mean(uz, 2);
+    [ipRatio(k), asymmetry(k), reverseFrac(k)] = ...
+        truth_disturbance_metrics(xq, zq, ux, uy, uz);
+end
+
+disturbance = hypot(ipRatio, asymmetry) + reverseFrac;
+[region, threshold] = classify_regions(M.slice_pos_mm, radius, disturbance);
+baseline = max(radius, [], 'omitnan');
+ratio = radius / baseline;
+regionId = region_ids(region);
+
+regions = table(M.slice_idx, M.slice_pos_mm, radius, ratio, ipRatio, ...
+    asymmetry, reverseFrac, disturbance, repmat(threshold, n, 1), ...
+    regionId, region, 'VariableNames', {'slice_idx', 'slice_pos_mm', ...
+    'lumen_radius_mm', 'radius_ratio', 'truth_inplane_ratio', ...
+    'truth_asymmetry', 'truth_reverse_frac', 'truth_disturbance', ...
+    'disturbance_threshold', 'region_id', 'vessel_region'});
+end
+
+
+function [ipRatio, asymmetry, reverseFrac] = ...
+        truth_disturbance_metrics(x, z, ux, uy, uz)
+ok = isfinite(ux) & isfinite(uy) & isfinite(uz);
+if ~any(ok)
+    [ipRatio, asymmetry, reverseFrac] = deal(nan);
+    return;
+end
+x = x(ok);
+z = z(ok);
+ux = ux(ok);
+uy = uy(ok);
+uz = uz(ok);
+den = sqrt(mean(uy.^2));
+ipRatio = sqrt(mean(ux.^2 + uz.^2)) / max(den, eps);
+
+[~, ~, g] = unique(round(hypot(x, z), 9));
+radialMean = accumarray(g, uy, [], @mean);
+asymmetry = sqrt(mean((uy - radialMean(g)).^2)) / max(den, eps);
+
+peak = max(abs(uy));
+if peak < eps
+    reverseFrac = 0;
+else
+    reverseFrac = mean(uy < -0.02 * peak);
+end
+end
+
+
+function [region, disturbanceThreshold] = classify_regions(y, radius, disturbance)
+%CLASSIFY_REGIONS Geometry defines the stenosis; truth defines disturbance.
+[ys, order] = sort(y);
+rs = radius(order);
+ds = disturbance(order);
+n = numel(ys);
+labels = repmat("uniform vessel", n, 1);
+
+baseline = max(rs, [], 'omitnan');
+minimum = min(rs, [], 'omitnan');
+depth = baseline - minimum;
+if ~isfinite(depth) || depth / baseline < 0.05
+    disturbanceThreshold = nan;
+    region = strings(n, 1);
+    region(order) = labels;
+    return;
+end
+
+geometryThreshold = baseline - 0.10 * depth;
+throatThreshold = minimum + 0.15 * depth;
+narrow = find(rs < geometryThreshold);
+throat = find(rs <= throatThreshold);
+[~, iMinimum] = min(rs);
+if isempty(narrow)
+    narrow = iMinimum;
+end
+if isempty(throat)
+    throat = iMinimum;
+end
+onset = narrow(1);
+throatStart = throat(1);
+throatEnd = throat(end);
+
+labels(:) = "pre-stenosis";
+labels(onset:max(onset, throatStart - 1)) = "narrowing";
+labels(throatStart:throatEnd) = "stenosis throat";
+if throatEnd < n
+    labels(throatEnd + 1:end) = "post-stenosis";
+end
+
+upstream = ds(1:max(onset - 1, 1));
+upstream = upstream(isfinite(upstream));
+if isempty(upstream)
+    baseDisturbance = 0;
+    robustSigma = 0;
+else
+    baseDisturbance = median(upstream);
+    robustSigma = 1.4826 * median(abs(upstream - baseDisturbance));
+end
+disturbanceThreshold = max(0.08, baseDisturbance + 3 * robustSigma);
+
+disturbed = isfinite(ds) & ds > disturbanceThreshold;
+disturbanceStart = first_sustained(disturbed, throatEnd + 1, 2);
+if ~isempty(disturbanceStart)
+    labels(disturbanceStart:end) = "disturbed flow";
+    recoveredGeometry = rs >= geometryThreshold;
+    recoveredFlow = isfinite(ds) & ds <= disturbanceThreshold & recoveredGeometry;
+    recoveryStart = first_sustained(recoveredFlow, disturbanceStart + 1, 3);
+    if ~isempty(recoveryStart)
+        labels(recoveryStart:end) = "recovery";
+    end
+end
+
+region = strings(n, 1);
+region(order) = labels;
+end
+
+
+function idx = first_sustained(mask, startAt, runLength)
+idx = [];
+startAt = max(1, startAt);
+for k = startAt:max(startAt, numel(mask) - runLength + 1)
+    if k + runLength - 1 <= numel(mask) && all(mask(k:k + runLength - 1))
+        idx = k;
+        return;
+    end
+end
+end
+
+
+function id = region_ids(region)
+names = ["uniform vessel", "pre-stenosis", "narrowing", ...
+    "stenosis throat", "post-stenosis", "disturbed flow", "recovery"];
+id = nan(size(region));
+for k = 1:numel(names)
+    id(region == names(k)) = k - 1;
+end
+end
+
+
+function T = add_dataset(T, name)
+T.dataset = repmat(string(name), height(T), 1);
+T = movevars(T, 'dataset', 'Before', 1);
 end
 
 
 % ------------------------------------------------------------------ analysis
 
-function prof = build_profile(P, order, win, R_mm, step_mm)
-%BUILD_PROFILE Radial velocity profile per slice, on a uniform radial
-% lattice 0:step_mm:R_mm.
-%
-% Points sharing a radius are averaged first. Those per-radius means land on
-% the lattice that carries the final answer, in this fixed order:
-%
-%   1 interpolate  gaps between measured radii (linear)
-%   2 extrapolate  outward from the outermost measured radius (linear)
-%   3 no-slip      v = 0 at r = R, which is what the extrapolation aims at
-%   4 Savitzky-Golay along increasing radius
-%   5 restore_wall reinstates no-slip, which step 4 does not preserve
-%                  ->  vy_sg, the final result
-%
-% The lattice must be uniform before step 4: sgolayfilt assumes equal
-% sample spacing, and the raw radii (hypot of a square grid) are anything
-% but -- 37 distinct radii spaced 0.014..0.25 mm apart on the default grid.
-%
-% vy_raw keeps its old meaning and stays NaN away from a measured radius,
-% so the scatter in viz.plot_profile and the raw metric are unaffected.
-% vy_true is carried across the lattice the same way and pinned to 0 at the
-% wall; beyond the outermost measured radius it is inferred, not measured,
-% so slice_metrics scores vy_sg only where vy_raw is finite.
-slices = unique(P.slice_idx, 'stable');
-rl = (0 : step_mm : R_mm).';
-if rl(end) < R_mm - 1e-9
-    rl(end + 1) = R_mm;             % always land the no-slip anchor exactly
-end
-out = cell(1, numel(slices));
-for k = 1:numel(slices)
-    Q = P(P.slice_idx == slices(k), :);
-    [r, ~, g] = unique(round(Q.r_mm, 6));
-    n = accumarray(g, 1);
-    vy = accumarray(g, Q.Vy_mms, [], @meannan);
-    sd = accumarray(g, Q.Vy_mms, [], @stdnan);
-    tr = accumarray(g, Q.VyTrue_mms, [], @meannan);
-    nv = accumarray(g, double(isfinite(Q.Vy_mms)), [], @sum);
+function [P, field] = reconstruct_lumen(P, order, win, ph, sample_file, opts)
+%RECONSTRUCT_LUMEN Full 2-D field with exact no-slip wall anchors.
+% Raw estimates remain untouched. Missing interior and near-wall values are
+% interpolated only inside the known lumen, SG is applied to that field, and
+% synthetic wall samples are reset to exactly zero after filtering.
+d = load(sample_file, 'd_row');
+opts = src.default_opts(opts);
+step = opts.grid_step * 1e3;
+P.Vy_raw_mms = P.Vy_mms;
+P.Vy_fill_mms = nan(height(P), 1);
+P.Vy_sg_mms = nan(height(P), 1);
 
-    [vy_l, src_l, r_out] = fill_radial(rl, r, vy, R_mm);
-    tr_l = fill_radial(rl, r, tr, R_mm);
-    [n_l, nv_l, sd_l, raw_l] = bin_to_lattice(rl, r, n, nv, sd, vy);
+G = findgroups(P.dataset, P.slice_idx, P.seed_base);
+out = cell(1, max(G));
+for k = 1:max(G)
+    idx = find(G == k);
+    Q = P(idx, :);
+    radius = Q.lumen_radius_mm(1);
 
-    % A measured radius rarely lands exactly on the lattice, so let the
-    % binned raw value decide what counts as measured.
-    src_l(isfinite(raw_l) & src_l ~= "noslip") = "meas";
+    ng = ceil(radius / step);
+    gv = (-ng:ng) * step;
+    [GX, GZ] = meshgrid(gv, gv);
+    keep = hypot(GX, GZ) <= radius + 1e-9;
+    xg = GX(keep);
+    zg = GZ(keep);
+    nGrid = numel(xg);
 
-    sg = restore_wall(rl, sg_filter(vy_l, order, win), r_out, R_mm);
+    nWall = max(48, ceil(2 * pi * radius / (step / 2)));
+    theta = (0:nWall-1).' * (2 * pi / nWall);
+    xWall = radius * cos(theta);
+    zWall = radius * sin(theta);
+
+    [roiPresent, roiRow] = ismember(round([xg zg], 9), ...
+        round([Q.x_mm Q.z_mm], 9), 'rows');
+    rawGrid = nan(nGrid, 1);
+    rawGrid(roiPresent) = Q.Vy_raw_mms(roiRow(roiPresent));
+
+    measured = isfinite(Q.Vy_raw_mms);
+    if nnz(measured) >= 3
+        sourceX = [Q.x_mm(measured); xWall];
+        sourceZ = [Q.z_mm(measured); zWall];
+        sourceV = [Q.Vy_raw_mms(measured); zeros(nWall, 1)];
+        interpObj = scatteredInterpolant(sourceX, sourceZ, sourceV, ...
+            'natural', 'none');
+        fillGrid = interpObj(xg, zg);
+        missing = ~isfinite(fillGrid);
+        if any(missing)
+            nearestObj = scatteredInterpolant(sourceX, sourceZ, sourceV, ...
+                'nearest', 'nearest');
+            fillGrid(missing) = nearestObj(xg(missing), zg(missing));
+        end
+
+        sgGrid = local_poly_filter([xg; xWall], [zg; zWall], ...
+            [fillGrid; zeros(nWall, 1)], xg, zg, order, win, step);
+    else
+        fillGrid = nan(nGrid, 1);
+        sgGrid = nan(nGrid, 1);
+    end
+
+    y0 = Q.slice_pos_mm(1) * 1e-3;
+    ysp = linspace(y0 - d.d_row / 2, y0 + d.d_row / 2, 5);
+    [~, truthPath, ~] = ph.velocity( ...
+        repmat(xg * 1e-3, 1, numel(ysp)), ...
+        repmat(ysp, nGrid, 1), ...
+        repmat(zg * 1e-3, 1, numel(ysp)));
+    truthGrid = mean(truthPath, 2) * 1e3;
+
+    [matched, gridRow] = ismember(round([Q.x_mm Q.z_mm], 9), ...
+        round([xg zg], 9), 'rows');
+    P.Vy_fill_mms(idx(matched)) = fillGrid(gridRow(matched));
+    P.Vy_sg_mms(idx(matched)) = sgGrid(gridRow(matched));
+
+    sampleType = [repmat("grid", nGrid, 1); repmat("wall", nWall, 1)];
+    roiPresentAll = [roiPresent; false(nWall, 1)];
+    measuredAll = [isfinite(rawGrid); false(nWall, 1)];
+    area = [repmat(step^2, nGrid, 1); zeros(nWall, 1)];
+    rawAll = [rawGrid; nan(nWall, 1)];
+    fillAll = [fillGrid; zeros(nWall, 1)];
+    sgAll = [sgGrid; zeros(nWall, 1)];
+    truthAll = [truthGrid; zeros(nWall, 1)];
+    xAll = [xg; xWall];
+    zAll = [zg; zWall];
+    nAll = nGrid + nWall;
 
     out{k} = table( ...
-        repmat(Q.dataset(1), numel(rl), 1), ...
-        repmat(slices(k), numel(rl), 1), ...
-        repmat(Q.slice_pos_mm(1), numel(rl), 1), ...
-        rl, n_l, nv_l, raw_l, sd_l, vy_l, sg, tr_l, src_l, ...
-        'VariableNames', {'dataset', 'slice_idx', 'slice_pos_mm', 'r_mm', ...
-        'n_points', 'n_valid', 'vy_raw', 'vy_std', 'vy_fill', 'vy_sg', ...
-        'vy_true', 'src'});
+        repmat(Q.dataset(1), nAll, 1), ...
+        repmat(Q.slice_idx(1), nAll, 1), ...
+        repmat(Q.slice_pos_mm(1), nAll, 1), ...
+        repmat(Q.seed_base(1), nAll, 1), ...
+        repmat(Q.slice_seed(1), nAll, 1), ...
+        repmat(Q.vessel_region(1), nAll, 1), ...
+        repmat(radius, nAll, 1), xAll, zAll, hypot(xAll, zAll), ...
+        sampleType, roiPresentAll, measuredAll, area, rawAll, fillAll, ...
+        sgAll, truthAll, 'VariableNames', {'dataset', 'slice_idx', ...
+        'slice_pos_mm', 'seed_base', 'slice_seed', 'vessel_region', ...
+        'lumen_radius_mm', 'x_mm', 'z_mm', 'r_mm', 'sample_type', ...
+        'roi_present', 'is_measured', 'cell_area_mm2', 'Vy_raw_mms', ...
+        'Vy_fill_mms', 'Vy_sg_mms', 'VyTrue_mms'});
+end
+field = vertcat(out{:});
+P = movevars(P, {'Vy_raw_mms', 'Vy_fill_mms', 'Vy_sg_mms'}, ...
+    'After', 'Vy_mms');
+end
+
+
+function y = local_poly_filter(x, z, v, xq, zq, order, win, step)
+%LOCAL_POLY_FILTER Savitzky-Golay equivalent on a masked 2-D neighbourhood.
+y = nan(size(xq));
+finite = isfinite(x) & isfinite(z) & isfinite(v);
+w = floor(win);
+if mod(w, 2) == 0
+    w = w - 1;
+end
+halfWidth = max(1, (w - 1) / 2) * step;
+tol = 1e-6 * max(step, 1);
+
+for i = 1:numel(xq)
+    nb = finite & abs(x - xq(i)) <= halfWidth + tol & ...
+        abs(z - zq(i)) <= halfWidth + tol;
+    xn = (x(nb) - xq(i)) / step;
+    zn = (z(nb) - zq(i)) / step;
+    vn = v(nb);
+    fitOrder = floor(order);
+    while fitOrder >= 0
+        A = polynomial_terms(xn, zn, fitOrder);
+        if size(A, 1) >= size(A, 2) && rank(A) == size(A, 2)
+            beta = A \ vn;
+            y(i) = beta(1);
+            break;
+        end
+        fitOrder = fitOrder - 1;
+    end
+end
+end
+
+
+function A = polynomial_terms(x, z, order)
+A = ones(numel(x), 1);
+for degree = 1:order
+    for px = degree:-1:0
+        pz = degree - px;
+        A(:, end + 1) = x.^px .* z.^pz; %#ok<AGROW>
+    end
+end
+end
+
+
+function prof = build_profile(field)
+%BUILD_PROFILE Velocity along the vessel-centre x-diameter (z = 0).
+% The signed coordinate preserves the two sides of an asymmetric or
+% disturbed profile. Quantitative metrics use the full 2-D field, not this
+% diagnostic cut.
+G = findgroups(field.dataset, field.slice_idx, field.seed_base);
+out = cell(1, max(G));
+for k = 1:max(G)
+    Q = field(G == k, :);
+    radius = Q.lumen_radius_mm(1);
+    gridRows = Q.sample_type == "grid";
+    zLevels = abs(Q.z_mm(gridRows));
+    z0 = min(zLevels, [], 'omitnan');
+    D = Q(gridRows & abs(abs(Q.z_mm) - z0) <= 1e-9, :);
+    D = sortrows(D, 'x_mm');
+
+    % Exact no-slip endpoints replace any coincident Cartesian boundary row.
+    interior = abs(D.x_mm) < radius - 1e-9;
+    D = D(interior, :);
+    x = [-radius; D.x_mm; radius];
+    n = [0; ones(height(D), 1); 0];
+    raw = [nan; D.Vy_raw_mms; nan];
+    nv = double(isfinite(raw));
+    sd = nan(size(x));
+    fillv = [0; D.Vy_fill_mms; 0];
+    sg = [0; D.Vy_sg_mms; 0];
+    truth = [0; D.VyTrue_mms; 0];
+    src_l = ["no-slip wall"; repmat("centre diameter", height(D), 1); ...
+        "no-slip wall"];
+
+    out{k} = table( ...
+        repmat(Q.dataset(1), numel(x), 1), ...
+        repmat(Q.slice_idx(1), numel(x), 1), ...
+        repmat(Q.slice_pos_mm(1), numel(x), 1), ...
+        repmat(Q.seed_base(1), numel(x), 1), ...
+        repmat(Q.slice_seed(1), numel(x), 1), ...
+        repmat(Q.vessel_region(1), numel(x), 1), ...
+        repmat(radius, numel(x), 1), x, n, nv, raw, sd, fillv, sg, truth, src_l, ...
+        'VariableNames', {'dataset', 'slice_idx', 'slice_pos_mm', ...
+        'seed_base', 'slice_seed', 'vessel_region', 'lumen_radius_mm', ...
+        'diameter_pos_mm', 'n_points', 'n_valid', 'vy_raw', 'vy_std', ...
+        'vy_fill', 'vy_sg', 'vy_true', 'src'});
 end
 prof = vertcat(out{:});
 end
 
 
-function [v, src_l, r_out] = fill_radial(rl, rm, vm, R_mm)
-%FILL_RADIAL Measured per-radius means onto the lattice: interpolate inside,
-% extrapolate outside, pin v = 0 at the wall. Radii whose points were all
-% NaN drop out here and are filled as interior gaps.
-% src_l is the per-lattice-radius provenance flag; it is not called src
-% because that would shadow the +src package inside this function.
-v = nan(size(rl));
-src_l = repmat("none", numel(rl), 1);
-ok = isfinite(vm) & isfinite(rm);
-r_out = nan;
-if ~any(ok)
-    src_l(rl >= R_mm - 1e-9) = "noslip";
-    v(rl >= R_mm - 1e-9) = 0;
-    return;
-end
-rm = rm(ok);
-vm = vm(ok);
-r_out = max(rm);
+function mseed = seed_slice_metrics(P, field)
+%SEED_SLICE_METRICS Score each independent seed/slice before aggregation.
+G = findgroups(P.dataset, P.slice_idx, P.seed_base);
+n = max(G);
+name = strings(n, 1);
+[slice, pos, seedBase, sliceSeed, nTot, nVal, frac, mtru] = ...
+    deal(nan(n, 1));
+[lumenRadius, radiusRatio, truthIp, truthAsym, truthReverse, truthDisturbance] = ...
+    deal(nan(n, 1));
+region = strings(n, 1);
+[biasRaw, stdRaw, rmRaw, nrRaw, biasSg, stdSg, rmSg, nrSg] = ...
+    deal(nan(n, 1));
+[nFull, rmFillFull, nrFillFull, rmSgFull, nrSgFull, flowFill, flowSg, ...
+    flowTruth, flowErrFill, flowErrSg] = deal(nan(n, 1));
 
-in = rl <= r_out + 1e-9;
-if sum(ok) == 1
-    v(in) = vm;                     % nothing to interpolate between
-else
-    v(in) = interp1(rm, vm, min(rl(in), r_out), 'linear');
-end
-src_l(in) = "interp";
-src_l(ismembertol(rl, rm, 1e-9, 'DataScale', 1)) = "meas";
-
-% Outward: straight line from the outermost measured value to (R, 0).
-out = ~in;
-if r_out < R_mm - 1e-9
-    v(out) = vm(end) * (R_mm - rl(out)) / (R_mm - r_out);
-else
-    v(out) = 0;
-end
-src_l(out) = "extrap";
-
-wall = rl >= R_mm - 1e-9;
-v(wall) = 0;
-src_l(wall) = "noslip";
-end
-
-
-function y = restore_wall(rl, y, r_out, R_mm)
-%RESTORE_WALL Put no-slip back after filtering. sgolayfilt does not honour
-% boundary values -- run over the ramp it drags the wall sample off zero and
-% can push it negative. Outside the measured range there is no noise to
-% filter anyway, so the tail is rebuilt as the straight line from the
-% filtered outermost measured value down to (R, 0).
-if ~isfinite(r_out) || r_out >= R_mm - 1e-9
-    y(rl >= R_mm - 1e-9) = 0;
-    return;
-end
-[~, i_out] = min(abs(rl - r_out));
-tail = rl > rl(i_out);
-y(tail) = y(i_out) * (R_mm - rl(tail)) / (R_mm - rl(i_out));
-y(rl >= R_mm - 1e-9) = 0;
-end
-
-
-function [n_l, nv_l, sd_l, raw_l] = bin_to_lattice(rl, rm, n, nv, sd, vy)
-%BIN_TO_LATTICE Per-radius counts and raw means to their nearest lattice
-% cell. raw_l stays NaN where nothing was measured, so vy_raw keeps meaning
-% "a measurement happened here".
-n_l = zeros(numel(rl), 1);
-nv_l = zeros(numel(rl), 1);
-sd_l = nan(numel(rl), 1);
-raw_l = nan(numel(rl), 1);
-if isempty(rm)
-    return;
-end
-[~, j] = min(abs(rl(:).' - rm(:)), [], 2);       % nearest lattice cell
-for i = 1:numel(rm)
-    n_l(j(i)) = n_l(j(i)) + n(i);
-    nv_l(j(i)) = nv_l(j(i)) + nv(i);
-    if isfinite(vy(i))
-        if isnan(raw_l(j(i)))
-            raw_l(j(i)) = vy(i);
-            sd_l(j(i)) = sd(i);
-        else
-            raw_l(j(i)) = mean([raw_l(j(i)), vy(i)]);
+for k = 1:n
+    Q = P(G == k, :);
+    name(k) = Q.dataset(1);
+    slice(k) = Q.slice_idx(1);
+    pos(k) = Q.slice_pos_mm(1);
+    seedBase(k) = Q.seed_base(1);
+    sliceSeed(k) = Q.slice_seed(1);
+    lumenRadius(k) = Q.lumen_radius_mm(1);
+    radiusRatio(k) = Q.radius_ratio(1);
+    truthIp(k) = Q.truth_inplane_ratio(1);
+    truthAsym(k) = Q.truth_asymmetry(1);
+    truthReverse(k) = Q.truth_reverse_frac(1);
+    truthDisturbance(k) = Q.truth_disturbance(1);
+    region(k) = Q.vessel_region(1);
+    nTot(k) = height(Q);
+    R = field(field.dataset == Q.dataset(1) & ...
+        field.slice_idx == Q.slice_idx(1) & ...
+        field.seed_base == Q.seed_base(1) & field.sample_type == "grid", :);
+    mf = isfinite(R.Vy_fill_mms) & isfinite(R.Vy_sg_mms) & ...
+        isfinite(R.VyTrue_mms);
+    nFull(k) = nnz(mf);
+    if any(mf)
+        truthFull = R.VyTrue_mms(mf);
+        refFull = mean(truthFull);
+        [rmFillFull(k), nrFillFull(k)] = rmse_pair( ...
+            R.Vy_fill_mms(mf) - truthFull, refFull);
+        [rmSgFull(k), nrSgFull(k)] = rmse_pair( ...
+            R.Vy_sg_mms(mf) - truthFull, refFull);
+        area = R.cell_area_mm2(mf);
+        flowFill(k) = sum(R.Vy_fill_mms(mf) .* area) * 0.06;
+        flowSg(k) = sum(R.Vy_sg_mms(mf) .* area) * 0.06;
+        flowTruth(k) = sum(truthFull .* area) * 0.06;
+        if abs(flowTruth(k)) >= eps
+            flowErrFill(k) = 100 * (flowFill(k) - flowTruth(k)) / ...
+                abs(flowTruth(k));
+            flowErrSg(k) = 100 * (flowSg(k) - flowTruth(k)) / ...
+                abs(flowTruth(k));
         end
     end
-end
-end
 
-
-function y = sg_filter(x, order, win)
-%SG_FILTER Savitzky-Golay along a gap-free uniform lattice. The window and
-% order are clipped to what the sample count supports. x arrives filled, so
-% there is nothing to skip -- the old version compacted around NaNs, which
-% silently treated non-adjacent radii as neighbours.
-y = x;
-fin = isfinite(x);
-if ~all(fin)
-    y(:) = nan;
-    return;
-end
-n = numel(x);
-if n < 3
-    return;
-end
-w = min(win, n);
-if mod(w, 2) == 0
-    w = w - 1;
-end
-k = min(order, w - 1);
-if w < 3 || k < 1
-    return;
-end
-y = sgolayfilt(x, k, w);
-end
-
-
-function msl = slice_metrics(P, prof)
-%SLICE_METRICS One row per slice: point-level, profile-level and filtered.
-slices = unique(P.slice_idx, 'stable');
-name = strings(numel(slices), 1);
-pos = nan(numel(slices), 1);
-nTot = nan(numel(slices), 1);
-nVal = nan(numel(slices), 1);
-frac = nan(numel(slices), 1);
-mtru = nan(numel(slices), 1);
-bias = nan(numel(slices), 1);
-sdev = nan(numel(slices), 1);
-[rmPt, nrPt] = deal(nan(numel(slices), 1));
-[rmRa, nrRa] = deal(nan(numel(slices), 1));
-[rmSg, nrSg] = deal(nan(numel(slices), 1));
-
-for k = 1:numel(slices)
-    Q = P(P.slice_idx == slices(k), :);
-    R = prof(prof.slice_idx == slices(k), :);
-    name(k) = Q.dataset(1);
-    pos(k) = Q.slice_pos_mm(1);
-    nTot(k) = height(Q);
-    m = isfinite(Q.Vy_mms) & isfinite(Q.VyTrue_mms);
+    m = isfinite(Q.Vy_raw_mms) & isfinite(Q.Vy_sg_mms) & ...
+        isfinite(Q.VyTrue_mms);
     nVal(k) = nnz(m);
     frac(k) = nVal(k) / max(nTot(k), 1);
     if ~any(m)
         continue;
     end
-    e = Q.Vy_mms(m) - Q.VyTrue_mms(m);
-    mtru(k) = mean(Q.VyTrue_mms(m));
-    bias(k) = mean(e);
-    sdev(k) = std(e);
-    [rmPt(k), nrPt(k)] = rmse_pair(e, mtru(k));
 
-    mr = isfinite(R.vy_raw) & isfinite(R.vy_true);
-    if any(mr)
-        [rmRa(k), nrRa(k)] = rmse_pair(R.vy_raw(mr) - R.vy_true(mr), ...
-            mean(R.vy_true(mr)));
-    end
-    % vy_sg is defined across the whole lattice now, including the
-    % interpolated/extrapolated stretch. Score it only where something was
-    % actually measured, so it stays comparable with rmse_raw.
-    ms = isfinite(R.vy_sg) & isfinite(R.vy_true) & isfinite(R.vy_raw);
-    if any(ms)
-        [rmSg(k), nrSg(k)] = rmse_pair(R.vy_sg(ms) - R.vy_true(ms), ...
-            mean(R.vy_true(ms)));
-    end
+    truth = Q.VyTrue_mms(m);
+    eRaw = Q.Vy_raw_mms(m) - truth;
+    eSg = Q.Vy_sg_mms(m) - truth;
+    mtru(k) = mean(truth);
+    biasRaw(k) = mean(eRaw);
+    stdRaw(k) = std(eRaw);
+    [rmRaw(k), nrRaw(k)] = rmse_pair(eRaw, mtru(k));
+    biasSg(k) = mean(eSg);
+    stdSg(k) = std(eSg);
+    [rmSg(k), nrSg(k)] = rmse_pair(eSg, mtru(k));
 end
 
-msl = table(name, slices, pos, nTot, nVal, frac, mtru, bias, sdev, ...
-    rmPt, nrPt, rmRa, nrRa, rmSg, nrSg, 'VariableNames', ...
-    {'dataset', 'slice_idx', 'slice_pos_mm', 'n_points', 'n_valid', ...
-    'valid_frac', 'mean_true_mms', 'bias_mms', 'std_mms', ...
-    'rmse_pt_mms', 'nrmse_pt', 'rmse_raw_mms', 'nrmse_raw', ...
-    'rmse_sg_mms', 'nrmse_sg'});
+mseed = table(name, slice, pos, seedBase, sliceSeed, region, lumenRadius, ...
+    radiusRatio, truthIp, truthAsym, truthReverse, truthDisturbance, ...
+    nTot, nVal, frac, mtru, biasRaw, stdRaw, rmRaw, nrRaw, ...
+    biasSg, stdSg, rmSg, nrSg, nFull, rmFillFull, nrFillFull, rmSgFull, ...
+    nrSgFull, flowFill, flowSg, flowTruth, flowErrFill, flowErrSg, ...
+    'VariableNames', {'dataset', 'slice_idx', 'slice_pos_mm', ...
+    'seed_base', 'slice_seed', 'vessel_region', 'lumen_radius_mm', ...
+    'radius_ratio', 'truth_inplane_ratio', 'truth_asymmetry', ...
+    'truth_reverse_frac', 'truth_disturbance', 'n_points', 'n_valid', ...
+    'valid_frac', 'mean_true_mms', 'bias_raw_mms', 'std_raw_mms', ...
+    'rmse_raw_mms', 'nrmse_raw', 'bias_sg_mms', 'std_sg_mms', ...
+    'rmse_sg_mms', 'nrmse_sg', 'n_full_points', ...
+    'rmse_fill_full_mms', 'nrmse_fill_full', 'rmse_sg_full_mms', ...
+    'nrmse_sg_full', 'flow_fill_ml_min', 'flow_sg_ml_min', ...
+    'flow_true_ml_min', 'flow_error_fill_pct', 'flow_error_sg_pct'});
+end
+
+
+function msl = aggregate_seed_metrics(mseed)
+%AGGREGATE_SEED_METRICS One row per physical slice, mean +/- std over seeds.
+G = findgroups(mseed.dataset, mseed.slice_idx);
+n = max(G);
+name = strings(n, 1);
+[slice, pos, nSeeds, nTot, nVal, frac, fracSeedStd, mtru] = ...
+    deal(nan(n, 1));
+[lumenRadius, radiusRatio, truthIp, truthAsym, truthReverse, truthDisturbance] = ...
+    deal(nan(n, 1));
+region = strings(n, 1);
+[biasRaw, biasRawSeedStd, stdRaw, rmRaw, rmRawSeedStd, nrRaw, nrRawSeedStd] = ...
+    deal(nan(n, 1));
+[biasSg, biasSgSeedStd, stdSg, rmSg, rmSgSeedStd, nrSg, nrSgSeedStd] = ...
+    deal(nan(n, 1));
+
+for k = 1:n
+    Q = mseed(G == k, :);
+    name(k) = Q.dataset(1);
+    slice(k) = Q.slice_idx(1);
+    pos(k) = Q.slice_pos_mm(1);
+    region(k) = Q.vessel_region(1);
+    lumenRadius(k) = Q.lumen_radius_mm(1);
+    radiusRatio(k) = Q.radius_ratio(1);
+    truthIp(k) = Q.truth_inplane_ratio(1);
+    truthAsym(k) = Q.truth_asymmetry(1);
+    truthReverse(k) = Q.truth_reverse_frac(1);
+    truthDisturbance(k) = Q.truth_disturbance(1);
+    nSeeds(k) = height(Q);
+    nTot(k) = mean(Q.n_points, 'omitnan');
+    nVal(k) = mean(Q.n_valid, 'omitnan');
+    frac(k) = mean(Q.valid_frac, 'omitnan');
+    fracSeedStd(k) = repeat_std(Q.valid_frac);
+    mtru(k) = mean(Q.mean_true_mms, 'omitnan');
+
+    biasRaw(k) = mean(Q.bias_raw_mms, 'omitnan');
+    biasRawSeedStd(k) = repeat_std(Q.bias_raw_mms);
+    stdRaw(k) = mean(Q.std_raw_mms, 'omitnan');
+    rmRaw(k) = mean(Q.rmse_raw_mms, 'omitnan');
+    rmRawSeedStd(k) = repeat_std(Q.rmse_raw_mms);
+    nrRaw(k) = mean(Q.nrmse_raw, 'omitnan');
+    nrRawSeedStd(k) = repeat_std(Q.nrmse_raw);
+
+    biasSg(k) = mean(Q.bias_sg_mms, 'omitnan');
+    biasSgSeedStd(k) = repeat_std(Q.bias_sg_mms);
+    stdSg(k) = mean(Q.std_sg_mms, 'omitnan');
+    rmSg(k) = mean(Q.rmse_sg_mms, 'omitnan');
+    rmSgSeedStd(k) = repeat_std(Q.rmse_sg_mms);
+    nrSg(k) = mean(Q.nrmse_sg, 'omitnan');
+    nrSgSeedStd(k) = repeat_std(Q.nrmse_sg);
+end
+
+msl = table(name, slice, pos, region, lumenRadius, radiusRatio, truthIp, ...
+    truthAsym, truthReverse, truthDisturbance, nSeeds, nTot, nVal, frac, ...
+    fracSeedStd, mtru, biasRaw, biasRawSeedStd, stdRaw, rmRaw, ...
+    rmRawSeedStd, nrRaw, ...
+    nrRawSeedStd, biasSg, biasSgSeedStd, stdSg, rmSg, rmSgSeedStd, nrSg, ...
+    nrSgSeedStd, 'VariableNames', {'dataset', 'slice_idx', 'slice_pos_mm', ...
+    'vessel_region', 'lumen_radius_mm', 'radius_ratio', ...
+    'truth_inplane_ratio', 'truth_asymmetry', 'truth_reverse_frac', ...
+    'truth_disturbance', 'n_seeds', 'n_points', 'n_valid', 'valid_frac', ...
+    'valid_frac_seed_std', 'mean_true_mms', 'bias_raw_mms', ...
+    'bias_raw_seed_std_mms', ...
+    'std_raw_mms', 'rmse_raw_mms', 'rmse_raw_seed_std_mms', ...
+    'nrmse_raw', 'nrmse_raw_seed_std', 'bias_sg_mms', ...
+    'bias_sg_seed_std_mms', 'std_sg_mms', 'rmse_sg_mms', ...
+    'rmse_sg_seed_std_mms', 'nrmse_sg', 'nrmse_sg_seed_std'});
+
+fullCols = {'n_full_points', 'rmse_fill_full_mms', 'nrmse_fill_full', ...
+    'rmse_sg_full_mms', 'nrmse_sg_full', 'flow_fill_ml_min', ...
+    'flow_sg_ml_min', 'flow_true_ml_min', 'flow_error_fill_pct', ...
+    'flow_error_sg_pct'};
+for j = 1:numel(fullCols)
+    value = nan(n, 1);
+    seedStd = nan(n, 1);
+    for k = 1:n
+        v = mseed.(fullCols{j})(G == k);
+        value(k) = mean(v, 'omitnan');
+        seedStd(k) = repeat_std(v);
+    end
+    msl.(fullCols{j}) = value;
+    msl.([fullCols{j} '_seed_std']) = seedStd;
+end
+
+% Compatibility aliases for the current plotting functions. The dedicated
+% raw/SG columns above remain authoritative.
+msl.bias_mms = msl.bias_sg_mms;
+msl.std_mms = msl.std_sg_mms;
+msl.rmse_pt_mms = msl.rmse_raw_mms;
+msl.nrmse_pt = msl.nrmse_raw;
 end
 
 
 function [r, nr] = rmse_pair(err, ref)
 r = sqrt(mean(err.^2));
-nr = r / ref;
+if ~isfinite(ref) || abs(ref) < eps
+    nr = nan;
+else
+    nr = r / abs(ref);
+end
 end
 
 
 function met = vessel_metrics(msl, name, vmax_mms)
-%VESSEL_METRICS Average the per-slice metrics over the vessel; the spread
-% across slices becomes the error bar in the summary figures.
-cols = {'valid_frac', 'bias_mms', 'std_mms', 'rmse_pt_mms', 'nrmse_pt', ...
-    'rmse_raw_mms', 'nrmse_raw', 'rmse_sg_mms', 'nrmse_sg'};
-met = table(string(name), vmax_mms, height(msl), sum(msl.n_valid), ...
-    'VariableNames', {'dataset', 'vmax_mms', 'n_slices', 'n_valid_total'});
+%VESSEL_METRICS Descriptive dataset-level values; slices remain primary.
+cols = {'valid_frac', 'bias_raw_mms', 'std_raw_mms', 'rmse_raw_mms', ...
+    'nrmse_raw', 'bias_sg_mms', 'std_sg_mms', 'rmse_sg_mms', 'nrmse_sg', ...
+    'nrmse_fill_full', 'nrmse_sg_full', 'flow_error_fill_pct', ...
+    'flow_error_sg_pct'};
+met = table(string(name), vmax_mms, height(msl), sum(msl.n_seeds), ...
+    sum(msl.n_valid .* msl.n_seeds), 'VariableNames', ...
+    {'dataset', 'vmax_mms', 'n_slices', 'n_seed_runs', 'n_valid_total'});
 for k = 1:numel(cols)
     v = msl.(cols{k});
     met.([cols{k} '_mean']) = mean(v, 'omitnan');
-    met.([cols{k} '_std']) = std(v, 'omitnan');
+    met.([cols{k} '_slice_std']) = repeat_std(v);
 end
 end
 
 
-function m = meannan(v)
-m = mean(v, 'omitnan');
+function s = repeat_std(v)
+v = v(isfinite(v));
+if numel(v) < 2
+    s = nan;
+else
+    s = std(v);
+end
 end
 
 
-function s = stdnan(v)
-s = std(v, 'omitnan');
+function Q = representative_seed_points(P)
+%REPRESENTATIVE_SEED_POINTS Keep one realisation per slice for diagnostics.
+G = findgroups(P.dataset, P.slice_idx);
+keep = false(height(P), 1);
+for k = 1:max(G)
+    idx = find(G == k);
+    seeds = P.seed_base(idx);
+    chosen = min(seeds);
+    keep(idx(seeds == chosen)) = true;
+end
+Q = P(keep, :);
 end
 
 

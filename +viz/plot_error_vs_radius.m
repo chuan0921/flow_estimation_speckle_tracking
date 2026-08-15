@@ -1,5 +1,5 @@
 function [fig, ax] = plot_error_vs_radius(prof, varargin)
-%PLOT_ERROR_VS_RADIUS Bias and spread of the vy error against radius.
+%PLOT_ERROR_VS_RADIUS Velocity error along the centre diameter.
 %
 %   viz.plot_error_vs_radius(prof)
 %   viz.plot_error_vs_radius(prof, 'Title', 'sim_v080cms', 'Relative', true)
@@ -34,9 +34,16 @@ if o.Relative
     unit = '%';
 end
 
-[r, braw, sraw] = collapse(prof.r_mm, e_raw);
-[~, bsg, ssg] = collapse(prof.r_mm, e_sg);
-[~, nval] = collapse(prof.r_mm, double(isfinite(prof.vy_raw)));
+if ismember('diameter_pos_mm', prof.Properties.VariableNames)
+    coord = prof.diameter_pos_mm;
+    xLabel = 'Position along centre diameter x [mm]';
+else
+    coord = prof.r_mm;
+    xLabel = 'radial position r [mm]';
+end
+[r, braw, sraw] = collapse(coord, e_raw);
+[~, bsg, ssg] = collapse(coord, e_sg);
+[~, nval] = collapse(coord, double(isfinite(prof.vy_raw)));
 
 fig = figure('Color', 'w', 'Name', 'error vs radius', ...
     'Position', [100 100 720 560]);
@@ -63,7 +70,7 @@ ax(2) = nexttile(tl);
 bar(ax(2), r, nval, 1, 'FaceColor', [0.6 0.64 0.7], 'EdgeColor', 'none');
 grid(ax(2), 'on');
 box(ax(2), 'on');
-xlabel(ax(2), 'radial position r [mm]');
+xlabel(ax(2), xLabel);
 ylabel(ax(2), 'slices');
 linkaxes(ax, 'x');
 xlim(ax(2), [min(r) - 0.05, max(r) + 0.05]);
