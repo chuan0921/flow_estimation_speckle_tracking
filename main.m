@@ -6,7 +6,10 @@ function S = main(data_root, varargin)
 %   S = main(root, 'Datasets', {'sim_v020cms'})
 %   S = main(root, 'Seeds', [100 200 300])
 %   S = main(root, 'Opts', struct('grid_step', 0.5e-3))
-%   S = main(root, 'Figures', false)          % CSVs only
+%   S = main(root, 'Figures', true)           % also draw the MATLAB figures
+%
+% Figures are off by default: main() writes CSVs, and make_figures.py renders
+% every figure from them.
 %
 % data_root is either a folder of dataset folders (each holding manifest.csv
 % and slices/) or a single dataset folder. Output lands in
@@ -35,6 +38,8 @@ function S = main(data_root, varargin)
 % derived per dataset from the transit lag d_row/(vmax*dt), so a bare
 % main(root) produces usable numbers. Anything set explicitly in
 % 'Opts' wins over the derived value.
+% opts.compensate_xz defaults to 'auto': off for analytic straight pipe and
+% on for CFD. Set it to logical true/false for an explicit override.
 %
 % See also SRC.ESTIMATE_SLICE, SRC.PHANTOM_PARABOLIC, SRC.PHANTOM_CFD.
 
@@ -53,7 +58,9 @@ p.addParameter('Seeds', 'auto', @valid_seeds);
 p.addParameter('Opts', struct(), @isstruct);
 p.addParameter('Phantom', [], @(v) isempty(v) || isstruct(v));
 p.addParameter('ResultsDir', fullfile(root, 'results'), @(v) ischar(v) || isstring(v));
-p.addParameter('Figures', true, @(v) islogical(v) && isscalar(v));
+% Off by default: figures are rendered from the CSVs by make_figures.py, so
+% a run costs nothing in plotting and a restyle costs nothing in compute.
+p.addParameter('Figures', false, @(v) islogical(v) && isscalar(v));
 p.addParameter('AutoLags', true, @(v) islogical(v) && isscalar(v));
 p.addParameter('SGOrder', 2, @(v) isnumeric(v) && isscalar(v) && v >= 1);
 p.addParameter('SGWindow', 5, @(v) isnumeric(v) && isscalar(v) && v >= 3);
@@ -100,6 +107,14 @@ for ds = 1:numel(sets)
     end
     opts = dataset_opts(char(jobs.file(1)), o);
     phantom = dataset_phantom(name, sets(ds).path, char(jobs.file(1)), o.Phantom);
+    opts = src.default_opts(opts);
+    opts.compensate_xz = src.resolve_xz_mode(opts.compensate_xz, phantom);
+    if opts.compensate_xz
+        xzLabel = 'on';
+    else
+        xzLabel = 'off';
+    end
+    fprintf('  xz compensation: %s\n', xzLabel);
     regions = build_vessel_regions(M, char(jobs.file(1)), phantom, opts);
 
     pts = cell(1, height(jobs));
@@ -401,9 +416,10 @@ end
 if ~isfield(opts, 'lag_max') || isempty(opts.lag_max)
     opts.lag_max = hi;
 end
-if ~isfield(opts, 'inplane_lags') || isempty(opts.inplane_lags)
-    opts.inplane_lags = unique(max(2, round(L * [0.5 1 2 4])));
-end
+% inplane_lags is deliberately not derived here. It belongs to the elevation
+% beam rather than to the row spacing, so src.estimate_slice builds it from
+% sigma_y, which this function does not load. Deriving it from L put every
+% rung past the beam crossing time.
 fprintf('  transit lag at vmax = %.1f frames -> lag scan %d..%d\n', ...
     L, opts.lag_min, opts.lag_max);
 end
@@ -632,6 +648,11 @@ function [P, field] = reconstruct_lumen(P, order, win, ph, sample_file, opts)
 % Raw estimates remain untouched. Missing interior and near-wall values are
 % interpolated only inside the known lumen, SG is applied to that field, and
 % synthetic wall samples are reset to exactly zero after filtering.
+%
+% The lumen is taken at the row1 plane, which is where src.geometry places
+% the ROIs. Streamlines follow the taper, so a scatterer near the wall at
+% row1 stays in the lumen all the way to row2 -- it simply arrives at a
+% different radius.
 d = load(sample_file, 'd_row');
 opts = src.default_opts(opts);
 step = opts.grid_step * 1e3;
@@ -644,7 +665,11 @@ out = cell(1, max(G));
 for k = 1:max(G)
     idx = find(G == k);
     Q = P(idx, :);
-    radius = Q.lumen_radius_mm(1);
+    y0 = Q.slice_pos_mm(1) * 1e-3;
+    radius = ph.wall_radius(y0 - d.d_row / 2) * 1e3;   % row1 plane
+    if ~isfinite(radius)
+        radius = Q.lumen_radius_mm(1);
+    end
 
     ng = ceil(radius / step);
     gv = (-ng:ng) * step;
@@ -665,10 +690,14 @@ for k = 1:max(G)
     rawGrid(roiPresent) = Q.Vy_raw_mms(roiRow(roiPresent));
 
     measured = isfinite(Q.Vy_raw_mms);
-    if nnz(measured) >= 3
-        sourceX = [Q.x_mm(measured); xWall];
-        sourceZ = [Q.z_mm(measured); zWall];
-        sourceV = [Q.Vy_raw_mms(measured); zeros(nWall, 1)];
+    % A Cartesian ROI can land exactly on the circular wall. Exclude it from
+    % interpolation sources so the exact no-slip anchor wins instead of
+    % scatteredInterpolant averaging two values at the same coordinate.
+    sourceMeasured = measured & hypot(Q.x_mm, Q.z_mm) < radius - 1e-9;
+    if nnz(sourceMeasured) >= 3
+        sourceX = [Q.x_mm(sourceMeasured); xWall];
+        sourceZ = [Q.z_mm(sourceMeasured); zWall];
+        sourceV = [Q.Vy_raw_mms(sourceMeasured); zeros(nWall, 1)];
         interpObj = scatteredInterpolant(sourceX, sourceZ, sourceV, ...
             'natural', 'none');
         fillGrid = interpObj(xg, zg);
@@ -686,13 +715,20 @@ for k = 1:max(G)
         sgGrid = nan(nGrid, 1);
     end
 
+    % Two truths on the reconstruction grid. The field is compared against
+    % the transit truth, because that is what every sample in it estimates;
+    % the flow is compared against the row1 plane, because a flow rate is a
+    % flux through a plane and only the plane version is conserved along the
+    % vessel (465 +/- 4 ml/min over all 41 slices, against 452-473 for the
+    % old fixed-column average).
     y0 = Q.slice_pos_mm(1) * 1e-3;
-    ysp = linspace(y0 - d.d_row / 2, y0 + d.d_row / 2, 5);
-    [~, truthPath, ~] = ph.velocity( ...
-        repmat(xg * 1e-3, 1, numel(ysp)), ...
-        repmat(ysp, nGrid, 1), ...
-        repmat(zg * 1e-3, 1, numel(ysp)));
-    truthGrid = mean(truthPath, 2) * 1e3;
+    y1 = y0 - d.d_row / 2;
+    [~, truthTransit] = src.transit_truth(ph, xg * 1e-3, zg * 1e-3, ...
+        y1, y0 + d.d_row / 2, d.d_row);
+    truthGrid = truthTransit * 1e3;
+    [~, truthPlane, ~] = ph.velocity(xg * 1e-3, repmat(y1, nGrid, 1), ...
+        zg * 1e-3);
+    truthPlane = truthPlane * 1e3;
 
     [matched, gridRow] = ismember(round([Q.x_mm Q.z_mm], 9), ...
         round([xg zg], 9), 'rows');
@@ -707,6 +743,7 @@ for k = 1:max(G)
     fillAll = [fillGrid; zeros(nWall, 1)];
     sgAll = [sgGrid; zeros(nWall, 1)];
     truthAll = [truthGrid; zeros(nWall, 1)];
+    planeAll = [truthPlane; zeros(nWall, 1)];
     xAll = [xg; xWall];
     zAll = [zg; zWall];
     nAll = nGrid + nWall;
@@ -720,11 +757,11 @@ for k = 1:max(G)
         repmat(Q.vessel_region(1), nAll, 1), ...
         repmat(radius, nAll, 1), xAll, zAll, hypot(xAll, zAll), ...
         sampleType, roiPresentAll, measuredAll, area, rawAll, fillAll, ...
-        sgAll, truthAll, 'VariableNames', {'dataset', 'slice_idx', ...
+        sgAll, truthAll, planeAll, 'VariableNames', {'dataset', 'slice_idx', ...
         'slice_pos_mm', 'seed_base', 'slice_seed', 'vessel_region', ...
         'lumen_radius_mm', 'x_mm', 'z_mm', 'r_mm', 'sample_type', ...
         'roi_present', 'is_measured', 'cell_area_mm2', 'Vy_raw_mms', ...
-        'Vy_fill_mms', 'Vy_sg_mms', 'VyTrue_mms'});
+        'Vy_fill_mms', 'Vy_sg_mms', 'VyTrue_mms', 'VyPlaneTrue_mms'});
 end
 field = vertcat(out{:});
 P = movevars(P, {'Vy_raw_mms', 'Vy_fill_mms', 'Vy_sg_mms'}, ...
@@ -834,7 +871,7 @@ region = strings(n, 1);
 [biasRaw, stdRaw, rmRaw, nrRaw, biasSg, stdSg, rmSg, nrSg] = ...
     deal(nan(n, 1));
 [nFull, rmFillFull, nrFillFull, rmSgFull, nrSgFull, flowFill, flowSg, ...
-    flowTruth, flowErrFill, flowErrSg] = deal(nan(n, 1));
+    flowTruth, flowTransit, flowErrFill, flowErrSg] = deal(nan(n, 1));
 
 for k = 1:n
     Q = P(G == k, :);
@@ -864,10 +901,23 @@ for k = 1:n
             R.Vy_fill_mms(mf) - truthFull, refFull);
         [rmSgFull(k), nrSgFull(k)] = rmse_pair( ...
             R.Vy_sg_mms(mf) - truthFull, refFull);
-        area = R.cell_area_mm2(mf);
-        flowFill(k) = sum(R.Vy_fill_mms(mf) .* area) * 0.06;
-        flowSg(k) = sum(R.Vy_sg_mms(mf) .* area) * 0.06;
-        flowTruth(k) = sum(truthFull .* area) * 0.06;
+    end
+    % The flow integral runs on its own mask and its own truth. A cell whose
+    % streamline never reaches row2 has no transit truth, but it still
+    % carries flux through the row1 plane, so excluding it would understate
+    % the true flow rather than the estimate. flow_transit_true_ml_min
+    % integrates the transit truth over the same cells, which separates the
+    % method's own bias -- the estimator reports a transit average where the
+    % flux wants a plane value -- from the estimation error.
+    mq = isfinite(R.Vy_fill_mms) & isfinite(R.Vy_sg_mms) & ...
+        isfinite(R.VyPlaneTrue_mms);
+    if any(mq)
+        area = R.cell_area_mm2(mq);
+        flowFill(k) = sum(R.Vy_fill_mms(mq) .* area) * 0.06;
+        flowSg(k) = sum(R.Vy_sg_mms(mq) .* area) * 0.06;
+        flowTruth(k) = sum(R.VyPlaneTrue_mms(mq) .* area) * 0.06;
+        tt = R.VyTrue_mms(mq);
+        flowTransit(k) = sum(tt(isfinite(tt)) .* area(isfinite(tt))) * 0.06;
         if abs(flowTruth(k)) >= eps
             flowErrFill(k) = 100 * (flowFill(k) - flowTruth(k)) / ...
                 abs(flowTruth(k));
@@ -900,7 +950,8 @@ mseed = table(name, slice, pos, seedBase, sliceSeed, region, lumenRadius, ...
     radiusRatio, truthIp, truthAsym, truthReverse, truthDisturbance, ...
     nTot, nVal, frac, mtru, biasRaw, stdRaw, rmRaw, nrRaw, ...
     biasSg, stdSg, rmSg, nrSg, nFull, rmFillFull, nrFillFull, rmSgFull, ...
-    nrSgFull, flowFill, flowSg, flowTruth, flowErrFill, flowErrSg, ...
+    nrSgFull, flowFill, flowSg, flowTruth, flowTransit, flowErrFill, ...
+    flowErrSg, ...
     'VariableNames', {'dataset', 'slice_idx', 'slice_pos_mm', ...
     'seed_base', 'slice_seed', 'vessel_region', 'lumen_radius_mm', ...
     'radius_ratio', 'truth_inplane_ratio', 'truth_asymmetry', ...
@@ -910,7 +961,8 @@ mseed = table(name, slice, pos, seedBase, sliceSeed, region, lumenRadius, ...
     'rmse_sg_mms', 'nrmse_sg', 'n_full_points', ...
     'rmse_fill_full_mms', 'nrmse_fill_full', 'rmse_sg_full_mms', ...
     'nrmse_sg_full', 'flow_fill_ml_min', 'flow_sg_ml_min', ...
-    'flow_true_ml_min', 'flow_error_fill_pct', 'flow_error_sg_pct'});
+    'flow_true_ml_min', 'flow_transit_true_ml_min', ...
+    'flow_error_fill_pct', 'flow_error_sg_pct'});
 end
 
 
@@ -983,8 +1035,8 @@ msl = table(name, slice, pos, region, lumenRadius, radiusRatio, truthIp, ...
 
 fullCols = {'n_full_points', 'rmse_fill_full_mms', 'nrmse_fill_full', ...
     'rmse_sg_full_mms', 'nrmse_sg_full', 'flow_fill_ml_min', ...
-    'flow_sg_ml_min', 'flow_true_ml_min', 'flow_error_fill_pct', ...
-    'flow_error_sg_pct'};
+    'flow_sg_ml_min', 'flow_true_ml_min', 'flow_transit_true_ml_min', ...
+    'flow_error_fill_pct', 'flow_error_sg_pct'};
 for j = 1:numel(fullCols)
     value = nan(n, 1);
     seedStd = nan(n, 1);

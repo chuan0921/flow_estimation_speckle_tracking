@@ -16,9 +16,10 @@ function T = estimate_slice(data_file, phantom, opts)
 % A raw CFD struct (one carrying grid_Uy) is still accepted and wrapped
 % with src.phantom_cfd automatically.
 %
-% Per grid point:
+% Per grid point when XZ compensation is enabled:
 %   0a  rough vy from a coarse uncompensated transit scan -> in-plane
-%       lag cap (survival-bias guard 0.25 * 2*sigma_y / vy)
+%       lag cap: the frames a scatterer needs to cross
+%       opts.inplane_survival elevation beam widths at that speed
 %   0b  in-plane vx/vz: chained multi-lag row1 self-correlation
 %       (src.in_plane)
 %   A   transit-lag scan with lag-dependent integer xz shift of the row2
@@ -26,9 +27,17 @@ function T = estimate_slice(data_file, phantom, opts)
 %   B   coarse drift at the transit peak (drift_match); optional
 %       speckle-size fine stage (refine_drift, opts.fine_on); then a
 %       recompensated rescan
-% Points the forward scan cannot answer fall back to a significance-gated
+% Analytic straight-pipe phantoms disable XZ compensation in auto mode: vx
+% and vz are fixed at zero, while the small-ROI spatially weighted vy rescan
+% is retained. Points the forward scan cannot answer fall back to a significance-gated
 % negative-lag (reverse flow) scan, controlled by opts.scan_reverse.
 % nmt outlier flag on the grid (flag only, estimates untouched).
+%
+% Truth comes from src.transit_truth: the streamline from row1 to row2 is
+% integrated, so VyTrue_mms is the speed the transit lag corresponds to and
+% points whose streamline never reaches row2 are NaN rather than scored.
+% VyPlaneTrue_mms (row1 plane, for the flow integral) and VyPathTrue_mms
+% (the superseded fixed-(x,z) average) are written alongside it.
 %
 % Requires sigma_y, k0, lambda in the slice file.
 %
@@ -50,6 +59,7 @@ d = load(data_file, 'iq_row1', 'iq_row2', 'x', 'z', 'dx', 'dz', 'Nt', ...
     'dt', 'xc', 'zc', 'R', 'd_row', 'y_row1', 'y_row2', 'slice_pos', ...
     'sigma_y', 'k0', 'lambda', 'vmax', 'flow_direction');
 ph = resolve_phantom(phantom, d);
+compensate_xz = src.resolve_xz_mode(opts.compensate_xz, ph);
 IQ1 = d.iq_row1;                       % complex single, for vz phase
 IQ2 = d.iq_row2;
 E1 = abs(IQ1);                         % single envelopes throughout
@@ -72,7 +82,11 @@ lag_max = min(opts.lag_max, Nt - 64);
 lags_f = unique(round(logspace(log10(opts.lag_min), log10(lag_max), ...
     opts.n_lag_scan)));
 lags_coarse = unique(round(logspace(log10(opts.lag_min), log10(lag_max), 40)));
-lag_ip = opts.inplane_lags(opts.inplane_lags < Nt / 2);
+if compensate_xz
+    lag_ip = inplane_ladder(opts, d, dt, Nt);
+else
+    lag_ip = [];
+end
 zshift = zeros(size(lags_coarse));
 rxf = round(opts.fine_roi_half_x / d.dx);
 rzf = round(opts.fine_roi_half_z / d.dz);
@@ -111,28 +125,51 @@ for p = 1:nP
     ix0 = ix0v(p);
     An = tp.normalize_patch(E1, iz0, ix0, rz, rx, Nt);
 
-    % 0a: rough vy for the in-plane lag cap.
-    t0 = tic;
-    cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, lags_coarse, ...
-        zshift, zshift, Nz, Nx, opts.fft_min_lags);
-    [vy_rough, ~] = tp.pick_peak(cc, lags_coarse, d_row, dt, 0.15);
-    cap = max(lag_ip);
-    if ~isnan(vy_rough)
-        cap = max(0.25 * 2 * d.sigma_y / max(abs(vy_rough), 1e-3) / dt, ...
-            lag_ip(1));
+    if compensate_xz
+        % 0a: rough vy for the in-plane lag cap.
+        t0 = tic;
+        cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, ...
+            lags_coarse, zshift, zshift, Nz, Nx, opts.fft_min_lags);
+        [vy_rough, ~] = tp.pick_peak(cc, lags_coarse, d_row, dt, 0.15);
+        cap = max(lag_ip);
+        if ~isnan(vy_rough)
+            % No floor. Flooring the cap at lag_ip(1) made the guard inert for
+            % 94% of the lumen and forced every fast ROI to match at a lag where
+            % its scatterers had already left the beam; a fast point is better
+            % served by no compensation (vxc = vzc = 0 below) than by one match
+            % on a pattern that is no longer there.
+            cap = opts.inplane_survival * 2 * d.sigma_y / ...
+                max(abs(vy_rough), 1e-3) / dt;
+        end
+        t_stage(1) = t_stage(1) + toc(t0);
+
+        % 0b: chained multi-lag in-plane vx/vz.
+        t0 = tic;
+        [vx_e(p), vz_e(p), n_ip(p)] = src.in_plane(E1, IQ1, iz0, ix0, ...
+            rz, rx, Nt, lag_ip, cap, dt, d, opts, Nz, Nx);
+        t_stage(2) = t_stage(2) + toc(t0);
+
+        vxc = vx_e(p);
+        vzc = vz_e(p);
+        if isnan(vxc), vxc = 0; end
+        if isnan(vzc), vzc = 0; end
+    else
+        % Fully developed straight-pipe truth has no in-plane motion.
+        vx_e(p) = 0;
+        vz_e(p) = 0;
+        vxc = 0;
+        vzc = 0;
     end
-    t_stage(1) = t_stage(1) + toc(t0);
-
-    % 0b: chained multi-lag in-plane vx/vz.
-    t0 = tic;
-    [vx_e(p), vz_e(p), n_ip(p)] = src.in_plane(E1, IQ1, iz0, ix0, ...
-        rz, rx, Nt, lag_ip, cap, dt, d, opts, Nz, Nx);
-    t_stage(2) = t_stage(2) + toc(t0);
-
-    vxc = vx_e(p);
-    vzc = vz_e(p);
-    if isnan(vxc), vxc = 0; end
-    if isnan(vzc), vzc = 0; end
+    % Compensation is applied whatever its size. Suppressing the small ones
+    % looks attractive -- the throat truly needs 0.68 px of shift on a 20 px
+    % window, and compensating there costs coverage -- but it cannot be
+    % detected: the in-plane estimate carries a floor of
+    % 0.5 px * d_row / (2*sigma_y) = 1.11 px, independent of speed and of the
+    % lag ladder, so the throat still measures 2.06 px. Gating at 1 px was
+    % inert (12% of the throat silenced, no metric moved) and at 2.5 px it
+    % silenced the narrowing slice instead, which genuinely needs 4.2 px but
+    % under-measures at 2.3 -- coverage 40.4% -> 26.8% there. Low misses,
+    % high kills the wrong points, and there is no window in between.
 
     % A: compensated transit scan.
     t0 = tic;
@@ -162,6 +199,28 @@ for p = 1:nP
             end
             t_stage(5) = t_stage(5) + toc(t0);
         end
+        continue;
+    end
+
+    % Straight pipe: keep the local spatial vy measurement, but do not
+    % estimate or apply any XZ drift.
+    if ~compensate_xz
+        t0 = tic;
+        if opts.vy_fine_on
+            zeroShift = zeros(size(lags_f));
+            cc = tp.scan_transit_lags_spatial(E1, E2, iz0, ix0, ...
+                rz_vy, rx_vy, Nt, lags_f, zeroShift, zeroShift, Nz, Nx, ...
+                opts.fft_min_lags, opts.vy_spatial_half);
+            [vy_2, cc_2] = tp.pick_peak(cc, lags_f, d_row, dt, ...
+                opts.cc_min, opts.prom_frac, opts.prom_w, ...
+                opts.prom_tail_min);
+            if ~isnan(vy_2)
+                vy_g(p) = vy_2;
+                cc_g(p) = cc_2;
+                refined(p) = true;
+            end
+        end
+        t_stage(4) = t_stage(4) + toc(t0);
         continue;
     end
 
@@ -217,15 +276,24 @@ end
 fprintf(['v2 timing [s]: rough %.0f, inplane %.0f, scanA %.0f, ' ...
     'stageB %.0f, reverse %.0f\n'], t_stage);
 
-% Ground truth averaged over the transit path. The phantom takes
-% vessel-centred x,z and absolute y, all in metres, and returns m/s.
-Xq = repmat(grid_x - d.xc, 1, 5);
-Zq = repmat(grid_z - d.zc, 1, 5);
-Yq = repmat(ysp, nP, 1);
-[ux_path, uy_path, uz_path] = ph.velocity(Xq, Yq, Zq);
-vx_true = mean(ux_path, 2);
-vy_true = mean(uy_path, 2);
-vz_true = mean(uz_path, 2);
+% Ground truth, in three flavours, because the estimator, the flow integral
+% and the old scoring are not after the same quantity:
+%
+%   transit  what the transit lag is: d_row/T along the streamline the
+%            scatterers actually follow (src.transit_truth). This is what
+%            Vy_mms is compared against.
+%   plane    uy on the row1 plane. A flow rate is a flux through a plane, so
+%            this is the only truth the flow integral can be scored on, and
+%            the only one conserved along the vessel.
+%   path     the old fixed-(x,z) 5-point average, kept so the change stays
+%            auditable rather than silent.
+[vx_true, vy_true, vz_true, reach] = src.transit_truth(ph, ...
+    grid_x - d.xc, grid_z - d.zc, d.y_row1, d.y_row2, d_row);
+[~, vy_plane, ~] = ph.velocity(grid_x - d.xc, repmat(d.y_row1, nP, 1), ...
+    grid_z - d.zc);
+[~, uy_path, ~] = ph.velocity(repmat(grid_x - d.xc, 1, 5), ...
+    repmat(ysp, nP, 1), repmat(grid_z - d.zc, 1, 5));
+vy_path = mean(uy_path, 2);
 
 % Reverse contiguity: a genuine recirculation pocket is spatially
 % connected; a reverse claim with no reverse neighbor is demoted to a
@@ -254,11 +322,43 @@ lag_peak_frames = d_row ./ (vy_g * dt);
 T = table((grid_x - d.xc) * 1e3, (grid_z - d.zc) * 1e3, r_pt * 1e3, ...
     vx_e * 1e3, vy_g * 1e3, vz_e * 1e3, ...
     vx_true * 1e3, vy_true * 1e3, vz_true * 1e3, ...
-    cc_g, lag_peak_frames, cc_B, is_rev, is_out, n_ip, refined, fine_ok, ...
+    vy_path * 1e3, vy_plane * 1e3, reach, ...
+    repmat(compensate_xz, nP, 1), cc_g, lag_peak_frames, cc_B, is_rev, ...
+    is_out, n_ip, refined, fine_ok, ...
     'VariableNames', {'x_mm', 'z_mm', 'r_mm', 'Vx_mms', 'Vy_mms', ...
-    'Vz_mms', 'VxTrue_mms', 'VyTrue_mms', 'VzTrue_mms', 'ccA', ...
-    'lag_peak_frames', 'ccB', 'reverse', 'outlier', 'n_lags_inplane', ...
-    'refined', 'fine'});
+    'Vz_mms', 'VxTrue_mms', 'VyTrue_mms', 'VzTrue_mms', ...
+    'VyPathTrue_mms', 'VyPlaneTrue_mms', 'reachable', ...
+    'xz_compensated', 'ccA', 'lag_peak_frames', 'ccB', 'reverse', ...
+    'outlier', 'n_lags_inplane', 'refined', 'fine'});
+end
+
+
+function lag_ip = inplane_ladder(opts, d, dt, Nt)
+%INPLANE_LADDER Lag ladder for the row1 self-correlation, in frames.
+%
+% Stage 0b tracks the speckle within row1, so its lags are bounded by how
+% long the scatterers stay in the elevation beam (2*sigma_y) -- not by the
+% row spacing d_row, which sets the transit scan instead. The two scales are
+% far apart: here 2*sigma_y/d_row = 0.45, so a ladder pitched at d_row
+% starts beyond the beam crossing time and no rung can ever be measured.
+%
+% The ladder runs one frame at a time up to 1.5 crossings at vmax; the
+% per-point cap in the main loop trims it to what that point's own speed
+% allows, so slow points near the wall (where the compensation is actually
+% large) get the whole ladder and a real slope fit, while fast points on the
+% axis (where it is ~1 px of a 20 px window) get one rung or none.
+lag_ip = opts.inplane_lags;
+if isempty(lag_ip)
+    n_cross = 2 * d.sigma_y / (max(d.vmax, 1e-3) * dt);
+    lag_ip = 1:max(2, round(1.5 * n_cross));
+end
+lag_ip = lag_ip(lag_ip >= 1 & lag_ip < Nt / 2);
+if isempty(lag_ip)
+    error('src:estimate_slice:noInplaneLags', ...
+        ['opts.inplane_lags left no lag in 1..%d frames. In-plane ' ...
+         'compensation would be silently disabled for every point.'], ...
+        ceil(Nt / 2) - 1);
+end
 end
 
 

@@ -35,6 +35,7 @@ if ~isempty(missing)
 end
 
 ph.name = 'cfd';
+ph.compensate_xz = true;
 ph.wall_radius = @wall_radius;
 ph.velocity = @velocity;
 
