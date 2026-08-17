@@ -19,8 +19,7 @@ from . import style as st
 DEFAULT_MAX_SLICES = 16
 
 
-def plot_cc_peak_map(P, title="", cc_col="ccA", lag_col="lag_peak_frames",
-                     hide_outliers=False, marker_size=44,
+def plot_cc_peak_map(P, title="", cc_col="ccA", hide_outliers=False, marker_size=44,
                      max_slices=DEFAULT_MAX_SLICES):
     for need in ("x_mm", "z_mm", cc_col):
         if need not in P.columns:
@@ -70,7 +69,7 @@ def plot_cc_peak_map(P, title="", cc_col="ccA", lag_col="lag_peak_frames",
         ax.set_ylim(zlim[1], zlim[0])          # z grows downwards
         st.style_axes(ax)
         ax.tick_params(labelsize=fs_tile)
-        ax.set_title(_tile_title(Q, slices[k], cc_col, lag_col),
+        ax.set_title(_tile_title(Q, slices[k], cc_col),
                      fontsize=fs_tile, pad=8, linespacing=1.3)
         if k + ncol >= n:                      # nothing below this tile
             ax.set_xlabel("x [mm]", fontsize=fs_tile + 2, labelpad=6)
@@ -95,16 +94,18 @@ def _draw_vessel(ax, Q):
             zorder=1)
 
 
-def _tile_title(Q, slice_value, cc_col, lag_col):
+def _tile_title(Q, slice_value, cc_col):
     """Two lines -- who the tile is, then how it did. One line is too wide to
     survive next to its neighbour once the grid has more than one column."""
     cc = Q[cc_col]
-    head = f"slice {slice_value:g}"
-    if "slice_pos_mm" in Q.columns and len(Q):
-        head += f", y={Q['slice_pos_mm'].iloc[0]:+.1f} mm"
-    stats = f"n={int(np.isfinite(cc).sum())}, cc={np.nanmedian(cc):.2f}"
-    if lag_col in Q.columns:
-        lag = np.nanmedian(Q[lag_col])
-        if np.isfinite(lag):
-            stats += f", lag={lag:.0f}"
+    head = f"Slice {slice_value:g}"
+    finite = cc[np.isfinite(cc)]
+    n_ok = finite.size
+    valid = 100 * n_ok / max(len(cc), 1)
+    if n_ok:
+        q25, q75 = np.percentile(finite, [25, 75])
+        stats = (f"valid={n_ok}/{len(cc)} ({valid:.1f}%)\n"
+                 f"CC med={np.median(finite):.2f} [IQR {q25:.2f}-{q75:.2f}]")
+    else:
+        stats = f"valid=0/{len(cc)} (0.0%), CC unavailable"
     return f"{head}\n{stats}"

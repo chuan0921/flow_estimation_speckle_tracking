@@ -1,20 +1,19 @@
 """Figure made from metrics_slice.csv (+ vessel_regions.csv): the vessel summary.
 
 Ports the current viz.plot_metrics_vs_slice, which main() saves as
-vessel_summary.png. Six stacked panels against elevational position, all
-sharing the vessel-region shading so every metric can be read against the
-geometry that produced it:
+vessel_summary.png. Five stacked panels against elevational position, every
+one of them an estimation result:
 
     1  NRMSE over the valid ROI mask, raw vs 2-D SG
     2  NRMSE over the full lumen (no-slip fill vs SG)
     3  flow error
     4  bias
     5  estimator yield
-    6  lumen radius and the truth disturbance score
 
 Error bars are the across-seed standard deviation and appear only where
-n_seeds > 1. Regions carry the full-vessel classification, so they stay
-correct even when the run estimated a subset of slices.
+n_seeds > 1. Regions are still read, but only to shade and label the three
+flow segments behind the panels; the geometry and truth-disturbance curves
+they come from are not plotted -- this figure is about the estimate.
 """
 
 from __future__ import annotations
@@ -33,28 +32,10 @@ FS_ANNOT = 14
 C_RAW = "#2966AD"       # [0.16 0.40 0.68]
 C_SG = "#D13D26"        # [0.82 0.24 0.15]
 C_GRAY = "#59616B"      # [0.35 0.38 0.42]
-C_GREEN = "#1F8557"     # [0.12 0.52 0.34]
 C_GOLD = "#DB8514"      # [0.86 0.52 0.08]
-C_DIST = "#853D94"      # [0.52 0.24 0.58]
-C_THRESH = "#737373"    # [0.45 0.45 0.45]
 
-REGION_COLOR = {
-    "pre-stenosis": "#B3BDC7",
-    "narrowing": "#F2B833",
-    "stenosis throat": "#DB402E",
-    "post-stenosis": "#4DA66B",
-    "disturbed flow": "#7A529E",
-    "recovery": "#338CBD",
-}
-REGION_LABEL = {
-    "pre-stenosis": "Pre-stenosis",
-    "narrowing": "Narrowing",
-    "stenosis throat": "Stenosis throat",
-    "post-stenosis": "Post-stenosis",
-    "disturbed flow": "Disturbed flow",
-    "recovery": "Recovery",
-}
-REGION_FALLBACK = ("#B8BCBF", "Uniform vessel")
+# Shading and labels come from style.segment: the pipeline's finer regions are
+# collapsed onto upstream / stenosis / downstream.
 
 
 def plot_vessel_summary(msl, regions=None, title=""):
@@ -63,8 +44,8 @@ def plot_vessel_summary(msl, regions=None, title=""):
     reg = _normalise_regions(m, regions)
     n_seeds = _col(m, "n_seeds", default=1.0)
 
-    fig = st.new_figure((12.5, 18.0))
-    axes = fig.subplots(6, 1, sharex=True)
+    fig = st.new_figure((12.5, 15.0))
+    axes = fig.subplots(5, 1, sharex=True)
 
     filled = []          # per panel: did anything finite get drawn?
 
@@ -120,29 +101,10 @@ def plot_vessel_summary(msl, regions=None, title=""):
     filled.append(_series(ax, y, 100 * _col(m, "valid_frac"),
                           100 * _col(m, "valid_frac_seed_std"), n_seeds,
                           C_GRAY, "o", None))
-    for k in np.flatnonzero(n_seeds > 1):
-        ax.text(y[k], 103, f"n={n_seeds[k]:.0f}", ha="center", va="bottom",
-                fontsize=FS_ANNOT, color="0.2")
+    _annotate_seed_counts(ax, y, n_seeds)
     ax.set_ylim(0, 112)
     _axis(ax, "Valid ROI [%]")
-
-    # 6 geometry and truth disturbance
-    ax = axes[5]
-    ry = reg["slice_pos_mm"].to_numpy(float)
-    h1, = ax.plot(ry, reg["lumen_radius_mm"], "-o", color=C_GREEN, lw=2.0,
-                  ms=5, label="Lumen radius")
-    _axis(ax, "Lumen radius [mm]")
     ax.set_xlabel("Slice position [mm]", fontsize=FS_LABEL, labelpad=10)
-    ax2 = ax.twinx()
-    h2, = ax2.plot(ry, reg["truth_disturbance"], "-", color=C_DIST, lw=2.2,
-                   label="Truth disturbance")
-    h3, = ax2.plot(ry, reg["disturbance_threshold"], "--", color=C_THRESH,
-                   lw=1.6, label="Disturbance threshold")
-    ax2.set_ylabel("Truth disturbance score", fontsize=FS_LABEL, labelpad=10)
-    ax2.tick_params(labelsize=FS_TICK)
-    ax.legend(handles=[h1, h2, h3], loc="upper left", fontsize=FS_LEGEND,
-              frameon=False, ncols=3)
-    filled.append(bool(np.isfinite(reg["lumen_radius_mm"]).any()))
 
     runs = _region_runs(reg)
     for ax, got in zip(axes, filled):
@@ -178,27 +140,28 @@ def _axis(ax, ylabel):
 
 
 def _normalise_regions(msl, regions):
-    """Region table sorted by position, synthesised from msl if not given."""
-    need = ["slice_pos_mm", "lumen_radius_mm", "truth_disturbance",
-            "vessel_region"]
+    """Position and segment label per slice, sorted; only what shading needs.
+
+    Falls back to the columns carried on msl itself, and finally to a single
+    unlabelled band, so the figure still draws for a vessel the pipeline never
+    classified.
+    """
+    need = ["slice_pos_mm", "vessel_region"]
     if regions is None or len(regions) == 0:
         if all(c in msl.columns for c in need):
             regions = msl[need].drop_duplicates()
         else:
-            regions = pd.DataFrame({
-                "slice_pos_mm": msl["slice_pos_mm"],
-                "lumen_radius_mm": np.nan,
-                "truth_disturbance": np.nan,
-                "vessel_region": REGION_FALLBACK[1].lower(),
-            })
-    regions = regions.sort_values("slice_pos_mm").copy()
-    if "disturbance_threshold" not in regions.columns:
-        regions["disturbance_threshold"] = np.nan
-    return regions
+            regions = pd.DataFrame({"slice_pos_mm": msl["slice_pos_mm"],
+                                    "vessel_region": "uniform vessel"})
+    return regions.sort_values("slice_pos_mm").copy()
 
 
 def _region_runs(reg):
-    """[(left, right, colour, label)] per contiguous run of one region.
+    """[(left, right, colour, label)] per contiguous run of one segment.
+
+    Runs are formed after collapsing the pipeline's regions onto the three
+    flow segments, so neighbouring regions that share a segment shade as one
+    band instead of a stripe per label.
 
     Edges sit halfway between neighbouring slices, so the shading tiles the
     axis without gaps or overlap.
@@ -210,17 +173,34 @@ def _region_runs(reg):
         mid = (y[:-1] + y[1:]) / 2
         edges = np.concatenate([[2 * y[0] - mid[0]], mid, [2 * y[-1] - mid[-1]]])
 
-    name = reg["vessel_region"].to_numpy()
-    change = np.concatenate([[True], name[1:] != name[:-1]])
+    seg = np.array([st.segment(v)[0] for v in reg["vessel_region"]], dtype=object)
+    change = np.concatenate([[True], seg[1:] != seg[:-1]])
     starts = np.flatnonzero(change)
-    stops = np.append(starts[1:] - 1, len(name) - 1)
+    stops = np.append(starts[1:] - 1, len(seg) - 1)
     out = []
     for s, e in zip(starts, stops):
-        key = str(name[s])
-        out.append((edges[s], edges[e + 1],
-                    REGION_COLOR.get(key, REGION_FALLBACK[0]),
-                    REGION_LABEL.get(key, REGION_FALLBACK[1])))
+        _, colour, label = st.segment(reg["vessel_region"].iloc[s])
+        out.append((edges[s], edges[e + 1], colour, label))
     return out
+
+
+def _annotate_seed_counts(ax, y, n_seeds):
+    """How many repeats each slice had.
+
+    Stated once when every slice ran the same number of seeds -- per-slice
+    labels collide into an unreadable strip past a handful of slices -- and
+    per slice only for the ones that differ from that norm.
+    """
+    rep = n_seeds[np.isfinite(n_seeds)]
+    if rep.size == 0 or rep.max() <= 1:
+        return
+    common = np.bincount(rep.astype(int)).argmax()
+    ax.text(0.995, 0.04, f"n = {common:.0f} seeds per slice",
+            transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=FS_ANNOT, color="0.25")
+    for k in np.flatnonzero(n_seeds != common):
+        ax.text(y[k], 103, f"n={n_seeds[k]:.0f}", ha="center", va="bottom",
+                fontsize=FS_ANNOT, color="0.2")
 
 
 def _note_if_empty(ax, has_data):

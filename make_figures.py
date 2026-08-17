@@ -66,9 +66,51 @@ def dataset_figures(ds_dir, out_dir=None, title=None, slice_idx=None):
                 viz.plot_vector_field(Tm, title=f"{title} slice {pick:g}",
                                       truth=True),
                 os.path.join(out_dir, "vector_field.png")))
+        written += roi_peak_figures(P, out_dir, title)
     if not written:
         print(f"skip: no CSV to plot in {ds_dir}")
     return written
+
+
+def roi_peak_figures(P, out_dir, title):
+    """Full ROI peak-lag map plus the three 3x3 zooms, per representative slice.
+
+    One slice per flow segment rather than all of them: the full map carries
+    per-tile text and is a large canvas, and three slices already answer "does
+    the lag behave differently upstream, in the throat and downstream".
+    """
+    written = []
+    for idx in _representative_slices(P):
+        d = viz.roi_peak_frame(P, idx)
+        lim = viz.lag_error_limit(d)
+        stem = f"slice_{int(idx):03d}"
+        head = f"{title} slice {idx:g}"
+        written.append(style.save(
+            viz.plot_roi_peak_map(d, title=head, lim=lim),
+            os.path.join(out_dir, "roi_peak", f"{stem}_full.png")))
+        for name, target in viz.ZOOMS:
+            written.append(style.save(
+                viz.plot_roi_peak_3x3(d, target, name, title=head, lim=lim),
+                os.path.join(out_dir, "roi_peak", f"{stem}_3x3_{name}.png")))
+    return written
+
+
+def _representative_slices(P):
+    """One slice per flow segment: the one nearest that segment's midpoint."""
+    if "vessel_region" not in P.columns:
+        slices = sorted(P["slice_idx"].unique())
+        return [slices[len(slices) // 2]]
+    d = P[["slice_idx", "slice_pos_mm", "vessel_region"]].drop_duplicates()
+    d = d.assign(seg=[style.segment(v)[0] for v in d["vessel_region"]])
+    picked = []
+    for seg, g in d.groupby("seg", sort=False):
+        mid = g["slice_pos_mm"].median()
+        row = g.iloc[(g["slice_pos_mm"] - mid).abs().to_numpy().argmin()]
+        picked.append((seg, row["slice_idx"], row["slice_pos_mm"]))
+    picked.sort(key=lambda t: t[2])
+    print("roi_peak: " + ", ".join(
+        f"{seg} -> slice {int(i)} (y={y:+.1f} mm)" for seg, i, y in picked))
+    return [i for _, i, _ in picked]
 
 
 def summary_figures(results_dir, out_dir=None, title=""):

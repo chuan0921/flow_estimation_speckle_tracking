@@ -32,7 +32,9 @@ def plot_profile(prof, title="", band=True):
             label="CFD truth")
 
     st.style_axes(ax)
-    region = f" - {prof['vessel_region'].iloc[0]}" if "vessel_region" in prof else ""
+    # Same three-segment naming the vessel summary shades with.
+    region = (f" - {st.segment(prof['vessel_region'].iloc[0])[2]}"
+              if "vessel_region" in prof else "")
     slice_idx = prof["slice_idx"].iloc[0]
     pos = prof["slice_pos_mm"].iloc[0]
     st.label_axes(ax, "Position along centre diameter x [mm]", "$v_y$ [mm/s]",

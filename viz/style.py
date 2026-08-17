@@ -168,6 +168,37 @@ def span(v):
     return (lo, hi)
 
 
+# ---- vessel segments -------------------------------------------------------
+# The pipeline classifies each slice from geometry and truth disturbance, which
+# yields up to six labels; post-stenosis in particular can be a single slice.
+# Figures collapse those onto the three flow states that actually differ:
+# entrance flow that has not developed, the accelerated core through the
+# throat, and the disturbed wake downstream. The boundary is geometric -- once
+# the lumen starts widening again the slice is downstream.
+SEGMENT_OF = {
+    "pre-stenosis": "upstream",
+    "narrowing": "upstream",
+    "stenosis throat": "stenosis",
+    "post-stenosis": "downstream",
+    "disturbed flow": "downstream",
+    "recovery": "downstream",
+}
+SEGMENT_STYLE = {
+    "upstream": ("#B3BDC7", "Upstream (developing)"),
+    "stenosis": ("#DB402E", "Stenosis (laminar)"),
+    "downstream": ("#7A529E", "Downstream (turbulent)"),
+}
+SEGMENT_FALLBACK = ("#B8BCBF", "Uniform vessel")
+
+
+def segment(region_name):
+    """(key, colour, label) for a pipeline region label."""
+    key = SEGMENT_OF.get(str(region_name).strip().lower())
+    if key is None:
+        return None, *SEGMENT_FALLBACK
+    return key, *SEGMENT_STYLE[key]
+
+
 def representative_seed(T):
     """Keep one realisation per (dataset, slice): the lowest seed_base.
 

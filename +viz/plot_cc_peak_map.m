@@ -12,7 +12,6 @@ function [fig, ax] = plot_cc_peak_map(P, varargin)
 % Name-value options
 %   Title          ''       figure title prefix
 %   CCColumn       'ccA'    table column used for peak correlation colour
-%   LagColumn      'lag_peak_frames'
 %   HideOutliers   false    hide rows flagged by the NMT outlier test
 %   MarkerSize     28       scatter marker area [pt^2]
 %   MaxSlices      Inf      plot at most this many slices, evenly sampled
@@ -23,14 +22,12 @@ p = inputParser;
 p.FunctionName = 'viz.plot_cc_peak_map';
 p.addParameter('Title', '', @(v) ischar(v) || isstring(v));
 p.addParameter('CCColumn', 'ccA', @(v) ischar(v) || isstring(v));
-p.addParameter('LagColumn', 'lag_peak_frames', @(v) ischar(v) || isstring(v));
 p.addParameter('HideOutliers', false, @(v) islogical(v) && isscalar(v));
 p.addParameter('MarkerSize', 28, @(v) isnumeric(v) && isscalar(v) && v > 0);
 p.addParameter('MaxSlices', Inf, @(v) isnumeric(v) && isscalar(v) && v > 0);
 p.parse(varargin{:});
 o = p.Results;
 ccCol = char(o.CCColumn);
-lagCol = char(o.LagColumn);
 
 need = {'x_mm', 'z_mm', ccCol};
 for k = 1:numel(need)
@@ -94,7 +91,7 @@ for k = 1:nS
     xlim(ax(k), xlimAll);
     ylim(ax(k), zlimAll);
     set(ax(k), 'YDir', 'reverse', 'Box', 'on', 'Layer', 'top', 'CLim', cl);
-    title(ax(k), tile_title(Q, slices(k), ccCol, lagCol), ...
+    title(ax(k), tile_title(Q, keep, slices(k), ccCol), ...
         'Interpreter', 'none', 'FontSize', 8);
     if k > (nRow - 1) * nCol
         xlabel(ax(k), 'x [mm]');
@@ -145,26 +142,30 @@ plot(ax, R * cos(th), R * sin(th), '-', 'Color', [0.20 0.20 0.20], ...
 end
 
 
-function s = tile_title(Q, sliceValue, ccCol, lagCol)
-pos = nan;
-if hasvar(Q, 'slice_pos_mm') && height(Q) > 0
-    pos = Q.slice_pos_mm(1);
-end
-cc = Q.(ccCol);
+function s = tile_title(Q, keep, sliceValue, ccCol)
+cc = Q.(ccCol)(keep);
+nTotal = nnz(keep);
 nOk = nnz(isfinite(cc));
 ccMed = median(cc, 'omitnan');
-lagMed = nan;
-if hasvar(Q, lagCol)
-    lagMed = median(Q.(lagCol), 'omitnan');
-end
-if isfinite(pos)
-    head = sprintf('slice %g, y=%+.1f mm', sliceValue, pos);
+ccIqr = quartiles(cc);
+head = sprintf('Slice %g', sliceValue);
+if isfinite(ccMed)
+    s = sprintf('%s\nvalid=%d/%d (%.1f%%)\nCC med=%.2f [IQR %.2f-%.2f]', ...
+        head, nOk, nTotal, 100 * nOk / max(nTotal, 1), ccMed, ...
+        ccIqr(1), ccIqr(2));
 else
-    head = sprintf('slice %g', sliceValue);
+    s = sprintf('%s\nvalid=0/%d (0.0%%), CC unavailable', head, nTotal);
 end
-if isfinite(lagMed)
-    s = sprintf('%s | n=%d, cc=%.2f, lag=%.0f', head, nOk, ccMed, lagMed);
+end
+
+
+function q = quartiles(v)
+v = sort(v(isfinite(v)));
+if isempty(v)
+    q = [nan nan];
+elseif isscalar(v)
+    q = [v v];
 else
-    s = sprintf('%s | n=%d, cc=%.2f', head, nOk, ccMed);
+    q = interp1(1:numel(v), v, 1 + (numel(v) - 1) * [0.25 0.75]);
 end
 end
