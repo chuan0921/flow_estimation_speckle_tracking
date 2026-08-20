@@ -4,6 +4,7 @@
     python3 make_figures.py results/sim_stenosis50_80cms   # one dataset
     python3 make_figures.py results                        # all + _summary
     python3 make_figures.py results --outdir /tmp/check    # somewhere else
+    python3 make_figures.py --speeds results/sim_v0*_5seed/sim_v0*  # one metric per PNG
 
 Figures land in <dataset>/figures/ and results/_summary/figures/ unless
 --outdir says otherwise. Each figure is a pure function of a CSV, so
@@ -24,7 +25,8 @@ from viz import style
 SUMMARY_DIR = "_summary"
 
 
-def dataset_figures(ds_dir, out_dir=None, title=None, slice_idx=None):
+def dataset_figures(ds_dir, out_dir=None, title=None, slice_idx=None,
+                    roi_slices=None):
     """Per-dataset figures. Returns the paths written."""
     ds_dir = os.path.abspath(ds_dir)
     out_dir = out_dir or os.path.join(ds_dir, "figures")
@@ -66,21 +68,22 @@ def dataset_figures(ds_dir, out_dir=None, title=None, slice_idx=None):
                 viz.plot_vector_field(Tm, title=f"{title} slice {pick:g}",
                                       truth=True),
                 os.path.join(out_dir, "vector_field.png")))
-        written += roi_peak_figures(P, out_dir, title)
+        written += roi_peak_figures(P, out_dir, title, roi_slices)
     if not written:
         print(f"skip: no CSV to plot in {ds_dir}")
     return written
 
 
-def roi_peak_figures(P, out_dir, title):
-    """Full ROI peak-lag map plus the three 3x3 zooms, per representative slice.
+def roi_peak_figures(P, out_dir, title, want=None):
+    """Full ROI peak-lag map plus the three 3x3 zooms, per requested slice.
 
-    One slice per flow segment rather than all of them: the full map carries
-    per-tile text and is a large canvas, and three slices already answer "does
-    the lag behave differently upstream, in the throat and downstream".
+    Defaults to one slice per flow segment rather than all of them: the full map
+    carries per-tile text and is a large canvas, and three slices already answer
+    "does the lag behave differently upstream, in the throat and downstream".
+    Pass want to name the slices instead, for a specific one worth reading.
     """
     written = []
-    for idx in _representative_slices(P):
+    for idx in (want if want else _representative_slices(P)):
         d = viz.roi_peak_frame(P, idx)
         lim = viz.lag_error_limit(d)
         stem = f"slice_{int(idx):03d}"
@@ -111,6 +114,21 @@ def _representative_slices(P):
     print("roi_peak: " + ", ".join(
         f"{seg} -> slice {int(i)} (y={y:+.1f} mm)" for seg, i, y in picked))
     return [i for _, i, _ in picked]
+
+
+def speed_figures(dataset_dirs, out_dir, title=""):
+    """One PNG per metric, every speed condition drawn in it.
+
+    The transpose of vessel_summary: that figure stacks a run's metrics, this
+    one lines a metric up across runs. Written to speed_<metric>.png so a
+    single metric can be opened without the others around it.
+    """
+    P = viz.collect_speeds(dataset_dirs)
+    names, _ = style.order_datasets(P["dataset"])
+    print(f"speeds: {', '.join(str(n) for n in names)}")
+    return [style.save(viz.plot_speed_metric(P, key, title=title),
+                       os.path.join(out_dir, f"speed_{key}.png"))
+            for key in viz.metric_keys()]
 
 
 def summary_figures(results_dir, out_dir=None, title=""):
@@ -183,24 +201,45 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("path", help="results/<dataset>, or the results root")
+    ap.add_argument("path", nargs="+",
+                    help="results/<dataset>, or the results root; with "
+                         "--speeds, one dataset folder per condition")
+    ap.add_argument("--speeds", action="store_true",
+                    help="combine the given dataset folders into one PNG per "
+                         "metric instead of per-dataset figures")
     ap.add_argument("--outdir", default=None,
                     help="default: <dataset>/figures and _summary/figures")
     ap.add_argument("--title", default=None, help="default: the folder name")
     ap.add_argument("--slice", type=float, default=None,
                     help="slice_idx for the vector field (default: the middle one)")
+    ap.add_argument("--roi-slice", type=float, action="append", default=None,
+                    metavar="IDX",
+                    help="slice_idx for the ROI peak-lag figures; repeatable. "
+                         "Default: one slice per flow segment")
     args = ap.parse_args()
 
-    path = os.path.abspath(args.path)
     written = []
+    if args.speeds:
+        out = args.outdir or os.path.join(
+            os.path.dirname(os.path.abspath(args.path[0])), "speed_figures")
+        for p in speed_figures([os.path.abspath(d) for d in args.path], out,
+                               args.title or ""):
+            print(p)
+        return
+
+    if len(args.path) > 1:
+        ap.error("pass one path, or use --speeds with several dataset folders")
+    path = os.path.abspath(args.path[0])
     if is_dataset_dir(path):
-        written += dataset_figures(path, args.outdir, args.title, args.slice)
+        written += dataset_figures(path, args.outdir, args.title, args.slice,
+                                   args.roi_slice)
     else:
         for ds in sorted(d for d in glob.glob(os.path.join(path, "*"))
                          if os.path.isdir(d) and is_dataset_dir(d)):
             sub = None if args.outdir is None else os.path.join(
                 args.outdir, os.path.basename(ds))
-            written += dataset_figures(ds, sub, args.title, args.slice)
+            written += dataset_figures(ds, sub, args.title, args.slice,
+                                       args.roi_slice)
         sub = None if args.outdir is None else os.path.join(args.outdir, SUMMARY_DIR)
         written += summary_figures(path, sub, args.title or "")
 

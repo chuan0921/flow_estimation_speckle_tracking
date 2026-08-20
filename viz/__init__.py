@@ -21,6 +21,10 @@ Across datasets        from                              figure
   plot_nrmse_vs_speed    _summary/metrics_slice_all.csv    nrmse_vs_speed.png
   plot_est_vs_true       pooled points.csv                 est_vs_true.png
   plot_bland_altman      pooled points.csv                 bland_altman_{raw,sg}.png
+Across speeds          from                              figure
+  plot_speed_metric      several metrics_slice.csv          speed_<metric>.png
+                         (viz.collect_speeds)               one metric per file,
+                                                            raw and SG separate
 
 Figures that show one point per ROI keep a single realisation per slice
 (style.representative_seed), matching representative_seed_points in main.m.
@@ -31,6 +35,7 @@ from .cc_peak_map import plot_cc_peak_map
 from .roi_peak import (ZOOMS, lag_error_limit, plot_roi_peak_3x3,
                        plot_roi_peak_map, roi_peak_frame)
 from .profile import plot_error_vs_radius, plot_profile
+from .speed_compare import collect_speeds, metric_keys, plot_speed_metric
 from .summary import (plot_bland_altman, plot_est_vs_true,
                       plot_nrmse_vs_speed, plot_valid_fraction)
 from .vector_field import plot_vector_field
@@ -44,4 +49,5 @@ __all__ = [
     "plot_roi_peak_3x3",
     "plot_nrmse_vs_speed", "plot_valid_fraction", "plot_est_vs_true",
     "plot_bland_altman",
+    "collect_speeds", "metric_keys", "plot_speed_metric",
 ]
