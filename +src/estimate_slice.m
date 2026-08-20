@@ -23,7 +23,9 @@ function T = estimate_slice(data_file, phantom, opts)
 %   0b  in-plane vx/vz: chained multi-lag row1 self-correlation
 %       (src.in_plane)
 %   A   transit-lag scan with lag-dependent integer xz shift of the row2
-%       patch (scan_transit_lags), cc_min peak (pick_peak)
+%       patch (scan_transit_lags), cc_min peak (pick_peak). Scanned twice,
+%       with the shift and without it, keeping whichever peak correlates
+%       better; xz_shift_kept records the outcome
 %   B   coarse drift at the transit peak (drift_match); optional
 %       speckle-size fine stage (refine_drift, opts.fine_on); then a
 %       recompensated rescan
@@ -88,15 +90,18 @@ else
     lag_ip = [];
 end
 zshift = zeros(size(lags_coarse));
+zshift_f = zeros(size(lags_f));
 rxf = round(opts.fine_roi_half_x / d.dx);
 rzf = round(opts.fine_roi_half_z / d.dz);
 rx_vy = round(opts.vy_fine_roi_half_x / d.dx);
 rz_vy = round(opts.vy_fine_roi_half_z / d.dz);
 
-% Reverse scan setup: negative log-spaced lags within the plausible
-% reverse speed range, only for points where the forward scan fails.
+% Reverse scan setup: auto is available only to phantoms that can contain
+% reverse flow. This prevents the stenosis downstream-y rule from creating
+% false reverse estimates in a uniform straight pipe.
+allow_auto_reverse = ~isfield(ph, 'allow_reverse') || ph.allow_reverse;
 scan_rev = strcmp(opts.scan_reverse, 'on') || ...
-    (strcmp(opts.scan_reverse, 'auto') && ...
+    (strcmp(opts.scan_reverse, 'auto') && allow_auto_reverse && ...
     d.slice_pos * 1e3 >= opts.rev_y_mm);
 lags_r = [];
 if scan_rev
@@ -117,6 +122,9 @@ cc_B = nan(nP, 1);
 n_ip = zeros(nP, 1);
 refined = false(nP, 1);
 fine_ok = false(nP, 1);
+shifted = false(nP, 1);        % did stage A keep the compensated candidate
+best_g = nan(nP, 1);           % interior CC maximum, gates or no gates
+curv_g = nan(nP, 1);           % peak curvature [1/frame^2] (see pick_peak)
 is_rev = false(nP, 1);
 t_stage = zeros(1, 5);         % rough / inplane / scanA / stageB / reverse
 
@@ -160,25 +168,54 @@ for p = 1:nP
         vxc = 0;
         vzc = 0;
     end
-    % Compensation is applied whatever its size. Suppressing the small ones
-    % looks attractive -- the throat truly needs 0.68 px of shift on a 20 px
-    % window, and compensating there costs coverage -- but it cannot be
-    % detected: the in-plane estimate carries a floor of
-    % 0.5 px * d_row / (2*sigma_y) = 1.11 px, independent of speed and of the
-    % lag ladder, so the throat still measures 2.06 px. Gating at 1 px was
-    % inert (12% of the throat silenced, no metric moved) and at 2.5 px it
-    % silenced the narrowing slice instead, which genuinely needs 4.2 px but
-    % under-measures at 2.3 -- coverage 40.4% -> 26.8% there. Low misses,
-    % high kills the wrong points, and there is no window in between.
+    % Whether this compensation is worth applying is settled in stage A by
+    % scanning with and without it, not by a threshold on its size. A
+    % threshold was tried and cannot work: gating at 1 px was inert (12% of
+    % the throat silenced, no metric moved) and at 2.5 px it silenced the
+    % narrowing slice instead, which genuinely needs 4.2 px of shift but
+    % under-measures at 2.3, taking that slice's coverage from 40.4% to
+    % 26.8%. Low misses, high kills the wrong points, and the in-plane
+    % estimate's own 1.1 px error leaves no window in between.
+    shifted(p) = vxc ~= 0 || vzc ~= 0;
 
-    % A: compensated transit scan.
+    % A: transit scan, run both compensated and uncompensated, keep the peak
+    % that actually correlates better.
+    %
+    % The shift applied here is the row1 lateral velocity extrapolated over
+    % the whole transit, and that extrapolation is wrong by a fixed amount
+    % this stage cannot measure: in the throat the row1 velocity points
+    % inwards but reverses past the neck, so the true offset is 0.68 px while
+    % the extrapolation asks for 3.22 px and the patch is searched 2.5 px away
+    % from where the speckle is. In the narrowing the error goes the other way
+    % (3.97 px applied against a true 5.72) and compensating clearly helps.
+    % Which case a point is in is not observable from the in-plane estimate --
+    % its own error is 1.1 px, larger than the thing that would have to be
+    % detected -- but the peak correlation is observable, so both candidates
+    % are scanned and the correlation decides. Nothing to scan twice when the
+    % shift is identically zero.
     t0 = tic;
-    oz = vzc * lags_f * dt / d.dz;
-    ox = vxc * lags_f * dt / d.dx;
-    cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, lags_f, oz, ox, ...
-        Nz, Nx, opts.fft_min_lags);
-    [vy_g(p), cc_g(p)] = tp.pick_peak(cc, lags_f, d_row, dt, opts.cc_min, ...
-        opts.prom_frac, opts.prom_w, opts.prom_tail_min);
+    cap_z = opts.xz_shift_max_ratio * d_row / d.dz;
+    cap_x = opts.xz_shift_max_ratio * d_row / d.dx;
+    oz = min(max(vzc * lags_f * dt / d.dz, -cap_z), cap_z);
+    ox = min(max(vxc * lags_f * dt / d.dx, -cap_x), cap_x);
+    [vy_g(p), cc_g(p), shp] = stage_a_pick(tp, opts, An, E2, iz0, ...
+        ix0, rz, rx, Nt, lags_f, oz, ox, Nz, Nx, d_row, dt);
+    best_g(p) = shp.best;
+    curv_g(p) = shp.curv;
+    if vxc ~= 0 || vzc ~= 0
+        [vy_0, cc_0, shp0] = stage_a_pick(tp, opts, An, E2, iz0, ...
+            ix0, rz, rx, Nt, lags_f, zshift_f, zshift_f, ...
+            Nz, Nx, d_row, dt);
+        if ~isnan(vy_0) && (isnan(vy_g(p)) || cc_0 > cc_g(p))
+            vy_g(p) = vy_0;
+            cc_g(p) = cc_0;
+            best_g(p) = shp0.best;
+            curv_g(p) = shp0.curv;
+                    vxc = 0;              % stage B and the reverse scan follow suit
+            vzc = 0;
+            shifted(p) = false;
+        end
+    end
     t_stage(3) = t_stage(3) + toc(t0);
 
     % Reverse fallback: significance-gated negative-lag scan for points
@@ -186,8 +223,8 @@ for p = 1:nP
     if isnan(vy_g(p))
         if scan_rev
             t0 = tic;
-            oz = vzc * lags_r * dt / d.dz;
-            ox = vxc * lags_r * dt / d.dx;
+            oz = min(max(vzc * lags_r * dt / d.dz, -cap_z), cap_z);
+            ox = min(max(vxc * lags_r * dt / d.dx, -cap_x), cap_x);
             [ccr, ccra, ccrb] = tp.scan_transit_lags(An, E2, iz0, ix0, ...
                 rz, rx, Nt, lags_r, oz, ox, Nz, Nx, opts.fft_min_lags);
             [vy_r, cc_r] = tp.pick_significant(ccr, ccra, ccrb, lags_r, ...
@@ -207,17 +244,18 @@ for p = 1:nP
     if ~compensate_xz
         t0 = tic;
         if opts.vy_fine_on
-            zeroShift = zeros(size(lags_f));
             cc = tp.scan_transit_lags_spatial(E1, E2, iz0, ix0, ...
-                rz_vy, rx_vy, Nt, lags_f, zeroShift, zeroShift, Nz, Nx, ...
+                rz_vy, rx_vy, Nt, lags_f, zshift_f, zshift_f, Nz, Nx, ...
                 opts.fft_min_lags, opts.vy_spatial_half);
-            [vy_2, cc_2] = tp.pick_peak(cc, lags_f, d_row, dt, ...
+            [vy_2, cc_2, shp2] = tp.pick_peak(cc, lags_f, d_row, dt, ...
                 opts.cc_min, opts.prom_frac, opts.prom_w, ...
                 opts.prom_tail_min);
             if ~isnan(vy_2)
                 vy_g(p) = vy_2;
                 cc_g(p) = cc_2;
-                refined(p) = true;
+                best_g(p) = shp2.best;
+                curv_g(p) = shp2.curv;
+                            refined(p) = true;
             end
         end
         t_stage(4) = t_stage(4) + toc(t0);
@@ -263,12 +301,14 @@ for p = 1:nP
             cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, lags_f, ...
                 oz, ox, Nz, Nx, opts.fft_min_lags);
         end
-        [vy_2, cc_2] = tp.pick_peak(cc, lags_f, d_row, dt, opts.cc_min, ...
-            opts.prom_frac, opts.prom_w, opts.prom_tail_min);
+        [vy_2, cc_2, shp2] = tp.pick_peak(cc, lags_f, d_row, dt, ...
+            opts.cc_min, opts.prom_frac, opts.prom_w, opts.prom_tail_min);
         if ~isnan(vy_2)
             vy_g(p) = vy_2;
             cc_g(p) = cc_2;
-            refined(p) = true;
+            best_g(p) = shp2.best;
+            curv_g(p) = shp2.curv;
+                    refined(p) = true;
         end
     end
     t_stage(4) = t_stage(4) + toc(t0);
@@ -288,7 +328,8 @@ fprintf(['v2 timing [s]: rough %.0f, inplane %.0f, scanA %.0f, ' ...
 %   path     the old fixed-(x,z) 5-point average, kept so the change stays
 %            auditable rather than silent.
 [vx_true, vy_true, vz_true, reach] = src.transit_truth(ph, ...
-    grid_x - d.xc, grid_z - d.zc, d.y_row1, d.y_row2, d_row);
+    grid_x - d.xc, grid_z - d.zc, d.y_row1, d.y_row2, d_row, ...
+    d.flow_direction);
 [~, vy_plane, ~] = ph.velocity(grid_x - d.xc, repmat(d.y_row1, nP, 1), ...
     grid_z - d.zc);
 [~, uy_path, ~] = ph.velocity(repmat(grid_x - d.xc, 1, 5), ...
@@ -323,13 +364,32 @@ T = table((grid_x - d.xc) * 1e3, (grid_z - d.zc) * 1e3, r_pt * 1e3, ...
     vx_e * 1e3, vy_g * 1e3, vz_e * 1e3, ...
     vx_true * 1e3, vy_true * 1e3, vz_true * 1e3, ...
     vy_path * 1e3, vy_plane * 1e3, reach, ...
-    repmat(compensate_xz, nP, 1), cc_g, lag_peak_frames, cc_B, is_rev, ...
-    is_out, n_ip, refined, fine_ok, ...
+    repmat(compensate_xz, nP, 1), shifted, cc_g, best_g, curv_g, ...
+    lag_peak_frames, cc_B, ...
+    is_rev, is_out, n_ip, refined, fine_ok, ...
     'VariableNames', {'x_mm', 'z_mm', 'r_mm', 'Vx_mms', 'Vy_mms', ...
     'Vz_mms', 'VxTrue_mms', 'VyTrue_mms', 'VzTrue_mms', ...
     'VyPathTrue_mms', 'VyPlaneTrue_mms', 'reachable', ...
-    'xz_compensated', 'ccA', 'lag_peak_frames', 'ccB', 'reverse', ...
+    'xz_compensated', 'xz_shift_kept', 'ccA', 'cc_best', 'cc_curv', ...
+    'lag_peak_frames', ...
+    'ccB', 'reverse', ...
     'outlier', 'n_lags_inplane', 'refined', 'fine'});
+end
+
+
+function [vy, pkv, shp] = stage_a_pick(tp, opts, An, E2, iz0, ix0, ...
+    rz, rx, Nt, lags, oz, ox, Nz, Nx, d_row, dt)
+%STAGE_A_PICK Stage A transit scan and gated peak in one step.
+% Alternative stage A windows were tried and lost to this plain scan: a
+% speckle-sized window with curve-level spatial averaging re-imports the
+% velocity mixture through the neighbours (RMSE 39 -> 63/170 on the
+% stenosis test slices), and per-member peak fitting against position
+% trades it for single-speckle peak jitter plus one-sided extrapolation
+% (39 -> 143/267). The window itself, roi_half, is the lever that works.
+cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, lags, oz, ox, ...
+    Nz, Nx, opts.fft_min_lags);
+[vy, pkv, shp] = tp.pick_peak(cc, lags, d_row, dt, opts.cc_min, ...
+    opts.prom_frac, opts.prom_w, opts.prom_tail_min);
 end
 
 

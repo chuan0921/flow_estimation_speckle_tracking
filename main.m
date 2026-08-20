@@ -97,7 +97,7 @@ for ds = 1:numel(sets)
     ensure_dir(outDir);
     fprintf('\n=== %s ===\n', name);
 
-    M = readtable(fullfile(sets(ds).path, 'manifest.csv'));
+    M = read_manifest(fullfile(sets(ds).path, 'manifest.csv'));
     files = resolve_files(M, sets(ds).path);
     pick = select_slices(height(M), o.Slices);
     jobs = discover_seed_jobs(M, files, pick, o.Seeds);
@@ -272,6 +272,34 @@ end
 end
 
 
+function M = read_manifest(path)
+%READ_MANIFEST Accept the comma- and tab-delimited manifests in the datasets.
+fid = fopen(path, 'r');
+if fid < 0
+    error('main:manifestOpen', 'Cannot open manifest: %s', path);
+end
+cleanup = onCleanup(@() fclose(fid));
+header = fgetl(fid);
+if ~ischar(header)
+    error('main:manifestEmpty', 'Manifest is empty: %s', path);
+end
+
+if contains(header, sprintf('	'))
+    delimiter = sprintf('	');
+else
+    delimiter = ',';
+end
+M = readtable(path, 'Delimiter', delimiter, 'VariableNamingRule', 'preserve');
+
+required = {'slice_idx', 'slice_pos_mm', 'file', 'flow_direction'};
+missing = required(~ismember(required, M.Properties.VariableNames));
+if ~isempty(missing)
+    error('main:manifestColumns', 'Manifest %s is missing column(s): %s', ...
+        path, strjoin(missing, ', '));
+end
+end
+
+
 function files = resolve_files(M, dsPath)
 %RESOLVE_FILES Manifest paths are absolute from generation time; fall back to
 % the slices/ folder next to the manifest when the data has been moved.
@@ -409,6 +437,17 @@ if ~all(isfield(s, {'d_row', 'dt', 'vmax', 'Nt'}))
 end
 L = s.d_row / (s.vmax * s.dt);        % transit lag at peak velocity [frames]
 lo = max(2, floor(0.5 * L));
+% 12*L caps the scan at 87 frames here, a floor of 77 mm/s, and the
+% wall-hugging ring below that floor does carry usable correlation (0.55 at
+% its true lag of 160-280 frames, measured with oracle compensation) -- but
+% every attempt to scan for it lost more than it gained. Opened to Nt-64,
+% near-wall windows preferred the 400+ frame frozen tail of their own slow
+% sliver over the genuine peak (36 confident wrong answers per 3 slices); a
+% prominence gate wide enough to reject those plateaus rejected the genuine
+% 160-280 frame peaks too (both live inside the gate's edge margin), and a
+% 24*L compromise polluted the 0.67-0.85 ring instead. The slow sliver and
+% the genuine peak are the same window's velocity mixture, so no lag-domain
+% gate separates them; the floor stays.
 hi = min(s.Nt - 64, max(ceil(12 * L), lo + 20));
 if ~isfield(opts, 'lag_min') || isempty(opts.lag_min)
     opts.lag_min = lo;
@@ -653,7 +692,7 @@ function [P, field] = reconstruct_lumen(P, order, win, ph, sample_file, opts)
 % the ROIs. Streamlines follow the taper, so a scatterer near the wall at
 % row1 stays in the lumen all the way to row2 -- it simply arrives at a
 % different radius.
-d = load(sample_file, 'd_row');
+d = load(sample_file, 'd_row', 'flow_direction');
 opts = src.default_opts(opts);
 step = opts.grid_step * 1e3;
 P.Vy_raw_mms = P.Vy_mms;
@@ -724,7 +763,7 @@ for k = 1:max(G)
     y0 = Q.slice_pos_mm(1) * 1e-3;
     y1 = y0 - d.d_row / 2;
     [~, truthTransit] = src.transit_truth(ph, xg * 1e-3, zg * 1e-3, ...
-        y1, y0 + d.d_row / 2, d.d_row);
+        y1, y0 + d.d_row / 2, d.d_row, d.flow_direction);
     truthGrid = truthTransit * 1e3;
     [~, truthPlane, ~] = ph.velocity(xg * 1e-3, repmat(y1, nGrid, 1), ...
         zg * 1e-3);

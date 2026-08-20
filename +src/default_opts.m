@@ -1,7 +1,14 @@
 function o = default_opts(o)
 %DEFAULT_OPTS Fill src.estimate_slice() options with defaults.
 def.grid_step = 0.25e-3;
-def.roi_half = 0.5e-3;
+% One speckle grain: lateral FWHM is 0.507 mm, and the transit peak's
+% usable height is the fraction of the window arriving in sync, so the
+% window must not span more velocity than the survival tolerance allows
+% (relative spread <= 2*sigma_y/d_row). Halving from 1.0 mm moved the
+% measurable boundary from r/R 0.65 to 0.80 and cut the straight-vessel
+% full-lumen error from 20% to 7%; below one grain there is no speckle
+% left to correlate.
+def.roi_half = 0.25e-3;
 % An ROI is sampled when the echo energy outside the lumen is at most this
 % fraction of the energy inside it (src.geometry). It replaces the old fixed
 % 0.9*R cut, so the lattice reaches the wall instead of stopping short of it.
@@ -45,11 +52,20 @@ def.fine_on = false;      % fine drift stage (two-grain window)
 def.fine_roi_half_x = 0.6e-3;   % half-extent: window holds two lateral grains
 def.fine_roi_half_z = 0.15e-3;  % one axial grain
 def.fine_win = 2;         % fine search half-width around the anchor [px]
+% The applied XZ shift is vx(row1)*L*dt, which grows without bound in L even
+% though the physical displacement cannot: if lag L is the true transit, the
+% shift is (vx/vy)*d_row regardless of L. In-plane flow above this fraction
+% of the through-plane speed does not occur in these vessels, so shifts are
+% clamped at xz_shift_max_ratio * d_row. Without the clamp the long-lag tail
+% of a scan walks the row2 window up to 76 px away -- four window widths --
+% onto unrelated speckle, and the reverse fallback manufactured 36 confident
+% wrong answers per three slices out of exactly that.
+def.xz_shift_max_ratio = 0.25;
 def.vy_fine_on = true;    % local speckle-ROI vy rescan, also used at zero XZ shift
 def.vy_fine_roi_half_x = 0.3e-3;  % one lateral grain half-extent
 def.vy_fine_roi_half_z = 0.15e-3; % one axial grain half-extent
 def.vy_spatial_half = 1;  % weighted CC filter over centre +/- one speckle ROI
-def.scan_reverse = 'auto';  % 'auto' | 'on' | 'off'
+def.scan_reverse = 'auto';  % auto follows phantom, then rev_y_mm
 def.rev_y_mm = 3.5;         % auto: scan reverse when slice_pos >= this
 def.rev_vy_max = 0.15;      % max plausible reverse speed [m/s]
 def.z_sig_rev = 2.2;        % significance gates for the reverse peak
@@ -57,7 +73,12 @@ def.z_broad = 1.5;
 def.z_half = 1.0;
 def.nb_half = 5;
 def.prom_frac = 0.3;        % peak prominence: required drop within prom_w
-def.prom_w = 12;            % samples to each side; edge-truncated = reject
+def.prom_w = 12;            % samples to each side; edge-truncated = reject.
+                            % Also one of the reverse scan's significance
+                            % gates, so it cannot be tuned for the forward
+                            % tail alone: widening it to 20 during the
+                            % long-lag experiments silently edge-rejected a
+                            % quarter of the reverse lag grid.
 def.prom_tail_min = 1200;   % forward: only gate peaks beyond this lag
 def.nmt_thresh = 2;
 def.nmt_eps_vy = 5e-3;

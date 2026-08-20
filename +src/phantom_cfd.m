@@ -36,6 +36,7 @@ end
 
 ph.name = 'cfd';
 ph.compensate_xz = true;
+ph.allow_reverse = true;
 ph.wall_radius = @wall_radius;
 ph.velocity = @velocity;
 

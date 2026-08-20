@@ -42,6 +42,7 @@ end
 
 ph.name = sprintf('parabolic (R = %.2f mm, vmax = %+.3g m/s)', R * 1e3, sgn * vmax);
 ph.compensate_xz = false;
+ph.allow_reverse = false;
 ph.wall_radius = @(y) R * ones(size(y));
 ph.velocity = @velocity;
 

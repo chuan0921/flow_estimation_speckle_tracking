@@ -137,17 +137,40 @@ right = min(cc(j + 1:j + prom_w));
 ok = left <= need && right <= need;
 end
 
-function [vy, pk] = pick_peak(cc, lags, d_row, dt, cc_min, prom_frac, ...
-    prom_w, prom_tail_min)
+function [vy, pk, shape] = pick_peak(cc, lags, d_row, dt, cc_min, ...
+    prom_frac, prom_w, prom_tail_min)
 %PICK_PEAK Global peak with cc_min gate, interior only, local-step
 % parabolic subframe interpolation (valid on non-uniform lag axes).
 % Optional prominence gate for long-lag peaks only (frozen-speckle
 % plateaus live in the tail; genuine broad shear peaks in the mid axis
 % are spared).
+%
+% shape carries two peak diagnostics, filled whenever an interior maximum
+% exists -- including for peaks the gates reject, so a threshold can be
+% swept after the fact instead of by re-running:
+%   best   the raw interior maximum (pk only reports gate-passing peaks)
+%   curv   -d2(cc)/d(lag)2 at the peak [1/frame^2]. Time-delay theory puts
+%          the estimator's random error at var ~ 1/(SNR * curvature): a
+%          broad shear-smeared peak localizes poorly no matter how high its
+%          cc value is, so this predicts jitter where cc alone cannot.
+% A peak-skew diagnostic (asymmetry) was also recorded for a while to test
+% whether the elevation-decorrelation envelope drags the fitted vertex
+% toward short lags; measured skew was zero-centred and uncorrelated with
+% the bias, so the column was dropped and the bias traced to the velocity
+% mixture inside the window instead.
 vy = nan;
 pk = nan;
+shape = struct('best', nan, 'curv', nan);
 [pval, j] = max(cc);
-if isnan(pval) || pval < cc_min || j == 1 || j == numel(lags)
+if isnan(pval)
+    return;
+end
+shape.best = pval;
+if j > 1 && j < numel(lags)
+    step = (lags(j + 1) - lags(j - 1)) / 2;
+    shape.curv = -(cc(j - 1) - 2 * cc(j) + cc(j + 1)) / step^2;
+end
+if pval < cc_min || j == 1 || j == numel(lags)
     return;
 end
 if nargin >= 8 && abs(lags(j)) >= prom_tail_min && ...

@@ -1,8 +1,10 @@
-function [vx, vy, vz, reach] = transit_truth(ph, x0, z0, y1, y2, d_row, nStep)
+function [vx, vy, vz, reach] = transit_truth(ph, x0, z0, y1, y2, d_row, ...
+    flow, nStep)
 %TRANSIT_TRUTH Ground truth along the path the scatterers actually take.
 %
 %   [vx, vy, vz, reach] = src.transit_truth(ph, x0, z0, y1, y2, d_row)
-%   [...] = src.transit_truth(..., nStep)
+%   [...] = src.transit_truth(..., flow)
+%   [...] = src.transit_truth(..., flow, nStep)
 %
 % x0, z0 are vessel-centred column vectors [m]; y1, y2 are the absolute
 % elevations of the row1 and row2 planes [m]; d_row is their separation [m].
@@ -37,14 +39,21 @@ function [vx, vy, vz, reach] = transit_truth(ph, x0, z0, y1, y2, d_row, nStep)
 % per slice, not per point. Truth does not depend on the speckle realisation
 % either, so a multi-seed run pays this once per slice.
 %
-% Assumes flow along +y, which is how the phantoms and the transit scan are
-% both oriented.
+% flow is the slice file's flow_direction (or a signed number); it fixes
+% which way along y counts as downstream. Only 'row1_to_row2' is exercised by
+% the current datasets -- for the reversed case T comes out negative and so
+% does vy, matching the sign the reverse-lag scan reports, but that path has
+% no data to check it against.
 %
 % See also SRC.ESTIMATE_SLICE, SRC.PHANTOM_CFD, SRC.PHANTOM_PARABOLIC.
 
 if nargin < 7
+    flow = 1;
+end
+if nargin < 8
     nStep = 200;
 end
+fsign = flow_sign(flow);
 x0 = x0(:);
 z0 = z0(:);
 n = numel(x0);
@@ -56,7 +65,7 @@ T = zeros(n, 1);
 reach = true(n, 1);
 for k = 0:nStep - 1
     [ux, uy, uz] = ph.velocity(x, repmat(y1 + k * dy, n, 1), z);
-    stall = ~(uy > 0);            % stagnant, reversed, or off the solution
+    stall = ~(uy * fsign > 0);    % stagnant, reversed, or off the solution
     reach = reach & ~stall;
     uy(stall) = nan;              % poisons T and the position from here on
     T = T + dy ./ uy;
@@ -70,4 +79,25 @@ vz = (z - z0) ./ T;
 vx(~reach) = nan;
 vy(~reach) = nan;
 vz(~reach) = nan;
+end
+
+
+function s = flow_sign(flow)
+%FLOW_SIGN Downstream direction along y, from flow_direction or a number.
+if isempty(flow)
+    s = 1;
+    return;
+end
+if isnumeric(flow) || islogical(flow)
+    s = sign(double(flow(1)));
+    if s == 0
+        s = 1;
+    end
+    return;
+end
+if strcmpi(strtrim(char(flow)), 'row2_to_row1')
+    s = -1;
+else
+    s = 1;
+end
 end
