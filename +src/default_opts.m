@@ -64,7 +64,17 @@ def.xz_shift_max_ratio = 0.25;
 def.vy_fine_on = true;    % local speckle-ROI vy rescan, also used at zero XZ shift
 def.vy_fine_roi_half_x = 0.3e-3;  % one lateral grain half-extent
 def.vy_fine_roi_half_z = 0.15e-3; % one axial grain half-extent
-def.vy_spatial_half = 1;  % weighted CC filter over centre +/- one speckle ROI
+% Stage B rescans vy with the speckle window; this is how many lateral
+% neighbour sub-windows join a curve-level weighted average around it.
+% Zero. The neighbours sit 0.65 mm away at a different radius, and averaging
+% their CC curves drags the peak exactly the way the stage A window mixture
+% did -- it was this pipeline's largest remaining bias once the window
+% shrank: switching 1 -> 0 took the straight-vessel full-lumen NRMSE from
+% 5.4% to 2.7% (80 cm/s) and 7.3% to 3.2% (20 cm/s), flow from +2.9% to
+% +1.3%, at identical coverage, and left the stenosis unchanged. The
+% remaining ring bias then matches the physical window-mixture model, so
+% the averaging was the missing mechanism, not a noise suppressor.
+def.vy_spatial_half = 0;
 def.scan_reverse = 'auto';  % auto follows phantom, then rev_y_mm
 def.rev_y_mm = 3.5;         % auto: scan reverse when slice_pos >= this
 def.rev_vy_max = 0.15;      % max plausible reverse speed [m/s]
