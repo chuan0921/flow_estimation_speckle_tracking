@@ -80,6 +80,30 @@ ix0v = round((grid_x - d.x(1)) / d.dx) + 1;
 iz0v = round((grid_z - d.z(1)) / d.dz) + 1;
 r_pt = hypot(grid_x - d.xc, grid_z - d.zc);
 
+% Geometric contraction shift: in a tapering vessel the scatterers follow
+% the wall, so the lateral displacement over the transit is (1 - R2/R1)
+% times the vector from the axis -- one number per slice, read off the
+% geometry, no estimation. Measured truth confirms it: the true shift in the
+% narrowing grows linearly with radius at exactly (1-R2/R1)/dx px per mm.
+% It is independent of the candidate lag for the same reason the shift clamp
+% is: if a lag is the true transit, the displacement is set by where the
+% streamline ends, not by how long it took. Zero for a straight pipe.
+%
+% Narrowing only. The follow-the-wall assumption holds where the pressure
+% gradient keeps the flow attached -- converging sections. In the expansion
+% the flow separates instead of following the wall outward, and offering the
+% outward shift there cost accuracy (downstream nrmse 3.1 -> 4.5) for no
+% coverage; with contr clamped at zero for expansions the candidate sleeps.
+R1w = ph.wall_radius(d.y_row1);
+R2w = ph.wall_radius(d.y_row2);
+if isfinite(R1w) && isfinite(R2w) && R1w > 0
+    contr = max(1 - R2w / R1w, 0);
+else
+    contr = 0;
+end
+ox_geo = -contr * (grid_x - d.xc) / d.dx;   % inward when narrowing
+oz_geo = -contr * (grid_z - d.zc) / d.dz;
+
 lag_max = min(opts.lag_max, Nt - 64);
 lags_f = unique(round(logspace(log10(opts.lag_min), log10(lag_max), ...
     opts.n_lag_scan)));
@@ -211,9 +235,32 @@ for p = 1:nP
             cc_g(p) = cc_0;
             best_g(p) = shp0.best;
             curv_g(p) = shp0.curv;
-                    vxc = 0;              % stage B and the reverse scan follow suit
+            vxc = 0;              % stage B and the reverse scan follow suit
             vzc = 0;
             shifted(p) = false;
+        end
+    end
+    % Third candidate: the geometric contraction shift. The in-plane
+    % estimate extrapolates the row1 lateral velocity, which lags the
+    % converging field and under-compensates by a third to a half (measured
+    % against oracle shifts: 2.4 px applied where the truth is 4.5); the
+    % contraction field is the part of the truth the wall geometry hands
+    % over for free, and in the narrowing it matches the measured true
+    % shift to within the fit noise. Constant over lags. Skipped when it
+    % is too small to differ from the zero candidate.
+    if compensate_xz && hypot(ox_geo(p), oz_geo(p)) > 0.5
+        [vy_gm, cc_gm, shpg] = stage_a_pick(tp, opts, An, E2, iz0, ...
+            ix0, rz, rx, Nt, lags_f, ...
+            repmat(oz_geo(p), size(lags_f)), ...
+            repmat(ox_geo(p), size(lags_f)), Nz, Nx, d_row, dt);
+        if ~isnan(vy_gm) && (isnan(vy_g(p)) || cc_gm > cc_g(p))
+            vy_g(p) = vy_gm;
+            cc_g(p) = cc_gm;
+            best_g(p) = shpg.best;
+            curv_g(p) = shpg.curv;
+            vxc = ox_geo(p) * d.dx * vy_gm / d_row;  % equivalent lateral
+            vzc = oz_geo(p) * d.dz * vy_gm / d_row;  % velocity for stage B
+            shifted(p) = true;
         end
     end
     t_stage(3) = t_stage(3) + toc(t0);
