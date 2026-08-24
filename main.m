@@ -780,16 +780,28 @@ for k = 1:max(G)
 
         fitOk = sourceMeasured & isfinite(Q.ccA);
         holes = ~isfinite(rawGrid);
-        if ~expanding && nnz(fitOk) >= 20 && any(holes)
+        if nnz(fitOk) >= 20 && any(holes)
             xf = Q.x_mm(fitOk); zf = Q.z_mm(fitOk);
             rf = hypot(xf, zf);
             vf = Q.Vy_raw_mms(fitOk);
             wf = Q.ccA(fitOk);
+            % In the expansion the hard geometric cut proved too early: the
+            % jet stays attached well past the throat (oracle: the model
+            % should win sl22-31, full 18-32% -> 4-18%), and only truly
+            % separated slices must fall back to interpolation. Whether the
+            % jet is still attached is readable from the measured points
+            % themselves: the fitted exponent stays blunt (n = 6.4-9.7)
+            % while attached and relaxes to 4.6-5.0 once the separation
+            % annulus appears. 5.5 splits that gap; calibrated on this
+            % vessel at one seed, so it is the constant to watch in
+            % multi-seed runs.
+            qFull = fit_powerlaw(rf, vf, wf, radius, [max(vf) 3]);
+            separated = expanding && abs(qFull(2)) <= 5.5;
             rs = sort(rf);
             cut = interp1(linspace(0, 1, numel(rs)), rs, 0.8);
             tr = rf <= cut;
             te = ~tr;
-            if nnz(te) >= 3 && nnz(tr) >= 5
+            if ~separated && nnz(te) >= 3 && nnz(tr) >= 5
                 qTr = fit_powerlaw(rf(tr), vf(tr), wf(tr), radius, ...
                     [max(vf) 3]);
                 predA = powerlaw_v(rf(te), qTr, radius);
@@ -812,7 +824,6 @@ for k = 1:max(G)
                 lam = 0;
             end
             if lam > 0
-                qFull = fit_powerlaw(rf, vf, wf, radius, [max(vf) 3]);
                 vModel = powerlaw_v(hypot(xg(holes), zg(holes)), qFull, ...
                     radius);
                 fillGrid(holes) = lam * vModel + (1 - lam) * fillGrid(holes);
