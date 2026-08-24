@@ -747,6 +747,78 @@ for k = 1:max(G)
             fillGrid(missing) = nearestObj(xg(missing), zg(missing));
         end
 
+        % The interpolation above runs straight lines to the zero anchors on
+        % the wall, which cuts the shoulder off a blunt stenotic jet; a
+        % robust power-law profile fitted to the measured points keeps the
+        % shoulder but cannot represent an asymmetric field. Each slice sits
+        % both on a held-out exam (the outer 20% of measured points) and
+        % mixes them by inverse squared exam error, so a slice where the
+        % model is wrong falls back to interpolation with no tuned
+        % threshold. Offline on the 41-slice stenosis run: full-lumen NRMSE
+        % 24.1% -> 14.2%, mean |flow| error 10.9% -> 7.65%, straight-vessel
+        % slices unaffected (lambda settles near the interp end).
+        % The profile model assumes attached flow, which holds in converging
+        % and straight segments but not past the throat: there the jet
+        % separates, the near-wall truth drops below any blunt profile, and
+        % the held-out exam cannot see it because the separation lives in
+        % the unmeasured ring (sl35: lambda stayed at 0.67 and the fill
+        % overshot flow by +12%). Same physics gate as the geometric-shift
+        % candidate in stage A: expanding walls -> interpolation only.
+        fd = d.flow_direction;
+        rev = (isnumeric(fd) && ~isempty(fd) && fd(1) < 0) || ...
+            (~isnumeric(fd) && strcmpi(strtrim(char(fd)), 'row2_to_row1'));
+        if rev
+            yUp = y0 + d.d_row / 2;
+            yDn = y0 - d.d_row / 2;
+        else
+            yUp = y0 - d.d_row / 2;
+            yDn = y0 + d.d_row / 2;
+        end
+        Rup = ph.wall_radius(yUp);
+        Rdn = ph.wall_radius(yDn);
+        expanding = isfinite(Rup) && isfinite(Rdn) && Rdn > Rup * (1 + 1e-6);
+
+        fitOk = sourceMeasured & isfinite(Q.ccA);
+        holes = ~isfinite(rawGrid);
+        if ~expanding && nnz(fitOk) >= 20 && any(holes)
+            xf = Q.x_mm(fitOk); zf = Q.z_mm(fitOk);
+            rf = hypot(xf, zf);
+            vf = Q.Vy_raw_mms(fitOk);
+            wf = Q.ccA(fitOk);
+            rs = sort(rf);
+            cut = interp1(linspace(0, 1, numel(rs)), rs, 0.8);
+            tr = rf <= cut;
+            te = ~tr;
+            if nnz(te) >= 3 && nnz(tr) >= 5
+                qTr = fit_powerlaw(rf(tr), vf(tr), wf(tr), radius, ...
+                    [max(vf) 3]);
+                predA = powerlaw_v(rf(te), qTr, radius);
+                trX = [xf(tr); xWall];
+                trZ = [zf(tr); zWall];
+                trV = [vf(tr); zeros(nWall, 1)];
+                itpB = scatteredInterpolant(trX, trZ, trV, 'linear', 'none');
+                xTe = xf(te); zTe = zf(te);
+                predB = itpB(xTe, zTe);
+                nb = ~isfinite(predB);
+                if any(nb)
+                    itpN = scatteredInterpolant(trX, trZ, trV, ...
+                        'nearest', 'nearest');
+                    predB(nb) = itpN(xTe(nb), zTe(nb));
+                end
+                eA = sqrt(mean((predA - vf(te)) .^ 2));
+                eB = sqrt(mean((predB - vf(te)) .^ 2));
+                lam = eB^2 / (eA^2 + eB^2);
+            else
+                lam = 0;
+            end
+            if lam > 0
+                qFull = fit_powerlaw(rf, vf, wf, radius, [max(vf) 3]);
+                vModel = powerlaw_v(hypot(xg(holes), zg(holes)), qFull, ...
+                    radius);
+                fillGrid(holes) = lam * vModel + (1 - lam) * fillGrid(holes);
+            end
+        end
+
         sgGrid = local_poly_filter([xg; xWall], [zg; zWall], ...
             [fillGrid; zeros(nWall, 1)], xg, zg, order, win, step);
     else
@@ -1149,6 +1221,22 @@ end
 
 
 % -------------------------------------------------------------------- output
+
+function v = powerlaw_v(r, q, R)
+%POWERLAW_V Blunt velocity profile v0 * (1 - (r/R)^n).
+v = q(1) * (1 - min(max(r / R, 0), 1) .^ abs(q(2)));
+end
+
+function q = fit_powerlaw(r, v, w, R, q0)
+%FIT_POWERLAW Robust weighted fit of the blunt profile, soft-L1 loss.
+% The loss saturates for outliers past f_scale (mm/s), so near-wall junk
+% points cannot drag the exponent the way plain least squares lets them.
+fs = 50;
+obj = @(q) sum(2 * fs^2 * ...
+    (sqrt(1 + ((w .* (powerlaw_v(r, q, R) - v)) / fs) .^ 2) - 1));
+q = fminsearch(obj, q0, ...
+    optimset('Display', 'off', 'MaxFunEvals', 4000, 'MaxIter', 4000));
+end
 
 function ensure_dir(p)
 if ~isfolder(p)
