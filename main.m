@@ -121,6 +121,7 @@ for ds = 1:numel(sets)
     t0 = tic;
     for k = 1:height(jobs)
         Ti = src.estimate_slice(char(jobs.file(k)), phantom, opts);
+        Ti = apply_lr_table(Ti, opts, char(jobs.file(k)));
         ir = find(regions.slice_idx == jobs.slice_idx(k), 1);
         Ti.dataset = repmat(string(name), height(Ti), 1);
         Ti.slice_idx = repmat(jobs.slice_idx(k), height(Ti), 1);
@@ -425,6 +426,27 @@ end
 end
 
 
+function T = apply_lr_table(T, opts, file)
+%APPLY_LR_TABLE Depth-dependent inter-row distance (experimental probes).
+% opts.d_row_table is [depth_mm, lr_mm]; the through-plane velocity is
+% scaled by lr(z)/d_row per ROI. v = d_row/(lag*dt) is linear in d_row,
+% so this post-hoc scaling equals re-estimating with the local
+% separation. Depths outside the table clamp to its end values.
+% Simulation datasets never pass the table, so they are untouched.
+if ~isfield(opts, 'd_row_table') || isempty(opts.d_row_table)
+    return;
+end
+tab = opts.d_row_table;
+d = load(file, 'zc', 'd_row');
+z_abs = d.zc * 1e3 + T.z_mm;               % ROI absolute depth [mm]
+lr = interp1(tab(:, 1), tab(:, 2), z_abs, 'linear');
+lr(z_abs <= tab(1, 1)) = tab(1, 2);
+lr(z_abs >= tab(end, 1)) = tab(end, 2);
+T.lr_mm = lr;
+T.Vy_mms = T.Vy_mms .* (lr / (d.d_row * 1e3));
+end
+
+
 function opts = dataset_opts(sample_file, o)
 %DATASET_OPTS Derive a lag range from this dataset's own transit lag.
 opts = o.Opts;
@@ -700,70 +722,101 @@ P.Vy_fill_mms = nan(height(P), 1);
 P.Vy_sg_mms = nan(height(P), 1);
 
 G = findgroups(P.dataset, P.slice_idx, P.seed_base);
-out = cell(1, max(G));
-for k = 1:max(G)
-    idx = find(G == k);
-    Q = P(idx, :);
+nG = max(G);
+out = cell(1, nG);
+
+% Pass 1: geometry, interpolation fill, profile fit and exam per slice.
+% The blend is NOT applied here. Its three parameters (v0, n, lambda) come
+% from ~100 measured points and a ~15-point exam per slice, and that
+% sampling noise lands directly on the fill as slice-to-slice jitter: a
+% degenerate plug fit returns n = 216 between neighbours at 8-10, and a
+% lambda of 0.73 between neighbours at 0.98 costs the slice 4 NRMSE
+% points. Adjacent slices are 0.5 mm apart, so the true profile cannot
+% jump; the parameters are median-smoothed over the +/-2 neighbouring
+% slices between the passes, which removes exactly those outliers and
+% leaves smooth stretches untouched.
+S = cell(1, nG);
+for k = 1:nG
+    st = struct();
+    st.idx = find(G == k);
+    Q = P(st.idx, :);
     y0 = Q.slice_pos_mm(1) * 1e-3;
+    st.y0 = y0;
     radius = ph.wall_radius(y0 - d.d_row / 2) * 1e3;   % row1 plane
     if ~isfinite(radius)
         radius = Q.lumen_radius_mm(1);
     end
+    st.radius = radius;
 
     ng = ceil(radius / step);
     gv = (-ng:ng) * step;
     [GX, GZ] = meshgrid(gv, gv);
     keep = hypot(GX, GZ) <= radius + 1e-9;
-    xg = GX(keep);
-    zg = GZ(keep);
-    nGrid = numel(xg);
+    st.xg = GX(keep);
+    st.zg = GZ(keep);
+    nGrid = numel(st.xg);
 
     nWall = max(48, ceil(2 * pi * radius / (step / 2)));
     theta = (0:nWall-1).' * (2 * pi / nWall);
-    xWall = radius * cos(theta);
-    zWall = radius * sin(theta);
+    st.xWall = radius * cos(theta);
+    st.zWall = radius * sin(theta);
+    st.nWall = nWall;
 
-    [roiPresent, roiRow] = ismember(round([xg zg], 9), ...
+    [st.roiPresent, roiRow] = ismember(round([st.xg st.zg], 9), ...
         round([Q.x_mm Q.z_mm], 9), 'rows');
     rawGrid = nan(nGrid, 1);
-    rawGrid(roiPresent) = Q.Vy_raw_mms(roiRow(roiPresent));
+    rawGrid(st.roiPresent) = Q.Vy_raw_mms(roiRow(st.roiPresent));
+    st.rawGrid = rawGrid;
 
     measured = isfinite(Q.Vy_raw_mms);
     % A Cartesian ROI can land exactly on the circular wall. Exclude it from
     % interpolation sources so the exact no-slip anchor wins instead of
     % scatteredInterpolant averaging two values at the same coordinate.
     sourceMeasured = measured & hypot(Q.x_mm, Q.z_mm) < radius - 1e-9;
-    if nnz(sourceMeasured) >= 3
-        sourceX = [Q.x_mm(sourceMeasured); xWall];
-        sourceZ = [Q.z_mm(sourceMeasured); zWall];
+    st.canFill = nnz(sourceMeasured) >= 3;
+    st.fillGrid = nan(nGrid, 1);
+    st.v0 = nan;
+    st.n = nan;
+    st.lam = nan;
+    st.expanding = false;
+    if st.canFill
+        sourceX = [Q.x_mm(sourceMeasured); st.xWall];
+        sourceZ = [Q.z_mm(sourceMeasured); st.zWall];
         sourceV = [Q.Vy_raw_mms(sourceMeasured); zeros(nWall, 1)];
         interpObj = scatteredInterpolant(sourceX, sourceZ, sourceV, ...
             'natural', 'none');
-        fillGrid = interpObj(xg, zg);
+        fillGrid = interpObj(st.xg, st.zg);
         missing = ~isfinite(fillGrid);
         if any(missing)
             nearestObj = scatteredInterpolant(sourceX, sourceZ, sourceV, ...
                 'nearest', 'nearest');
-            fillGrid(missing) = nearestObj(xg(missing), zg(missing));
+            fillGrid(missing) = nearestObj(st.xg(missing), st.zg(missing));
         end
+        st.fillGrid = fillGrid;
 
-        % The interpolation above runs straight lines to the zero anchors on
-        % the wall, which cuts the shoulder off a blunt stenotic jet; a
+        % The interpolation above runs straight lines to the zero anchors
+        % on the wall, which cuts the shoulder off a blunt stenotic jet; a
         % robust power-law profile fitted to the measured points keeps the
-        % shoulder but cannot represent an asymmetric field. Each slice sits
-        % both on a held-out exam (the outer 20% of measured points) and
-        % mixes them by inverse squared exam error, so a slice where the
-        % model is wrong falls back to interpolation with no tuned
-        % threshold. Offline on the 41-slice stenosis run: full-lumen NRMSE
-        % 24.1% -> 14.2%, mean |flow| error 10.9% -> 7.65%, straight-vessel
-        % slices unaffected (lambda settles near the interp end).
-        % The profile model assumes attached flow, which holds in converging
-        % and straight segments but not past the throat: there the jet
-        % separates, the near-wall truth drops below any blunt profile, and
-        % the held-out exam cannot see it because the separation lives in
-        % the unmeasured ring (sl35: lambda stayed at 0.67 and the fill
-        % overshot flow by +12%). Same physics gate as the geometric-shift
-        % candidate in stage A: expanding walls -> interpolation only.
+        % shoulder but cannot represent an asymmetric field. Each slice
+        % sits both on a held-out exam (the outer 20% of measured points)
+        % and mixes them by inverse squared exam error, so a slice where
+        % the model is wrong falls back to interpolation with no tuned
+        % threshold. 41-slice stenosis run: full-lumen NRMSE 24.1% ->
+        % 14.2%; straight vessels improve slightly (the parabola is the
+        % n = 2 member of the family).
+        %
+        % The model assumes attached flow. Downstream of the throat the
+        % jet eventually separates, the near-wall truth drops below any
+        % blunt profile, and the exam cannot see it because the
+        % separation lives in the unmeasured ring. The hard geometric cut
+        % (expanding -> no model) proved too early -- the jet stays
+        % attached well past the throat (sl22-31, full 18-32% -> 4-18%
+        % when allowed) -- so expansion only disqualifies the model once
+        % the measured profile itself has relaxed: the fitted exponent
+        % stays blunt (n = 6.4-9.7) while attached and drops to 4.6-5.0
+        % when separation appears. 5.5 splits that gap; calibrated on
+        % this vessel at one seed, the constant to watch in multi-seed
+        % runs.
         fd = d.flow_direction;
         rev = (isnumeric(fd) && ~isempty(fd) && fd(1) < 0) || ...
             (~isnumeric(fd) && strcmpi(strtrim(char(fd)), 'row2_to_row1'));
@@ -776,40 +829,33 @@ for k = 1:max(G)
         end
         Rup = ph.wall_radius(yUp);
         Rdn = ph.wall_radius(yDn);
-        expanding = isfinite(Rup) && isfinite(Rdn) && Rdn > Rup * (1 + 1e-6);
+        st.expanding = isfinite(Rup) && isfinite(Rdn) && ...
+            Rdn > Rup * (1 + 1e-6);
 
         fitOk = sourceMeasured & isfinite(Q.ccA);
-        holes = ~isfinite(rawGrid);
-        if nnz(fitOk) >= 20 && any(holes)
-            xf = Q.x_mm(fitOk); zf = Q.z_mm(fitOk);
+        if nnz(fitOk) >= 20 && any(~isfinite(rawGrid))
+            xf = Q.x_mm(fitOk);
+            zf = Q.z_mm(fitOk);
             rf = hypot(xf, zf);
             vf = Q.Vy_raw_mms(fitOk);
             wf = Q.ccA(fitOk);
-            % In the expansion the hard geometric cut proved too early: the
-            % jet stays attached well past the throat (oracle: the model
-            % should win sl22-31, full 18-32% -> 4-18%), and only truly
-            % separated slices must fall back to interpolation. Whether the
-            % jet is still attached is readable from the measured points
-            % themselves: the fitted exponent stays blunt (n = 6.4-9.7)
-            % while attached and relaxes to 4.6-5.0 once the separation
-            % annulus appears. 5.5 splits that gap; calibrated on this
-            % vessel at one seed, so it is the constant to watch in
-            % multi-seed runs.
             qFull = fit_powerlaw(rf, vf, wf, radius, [max(vf) 3]);
-            separated = expanding && abs(qFull(2)) <= 5.5;
+            st.v0 = qFull(1);
+            st.n = abs(qFull(2));
             rs = sort(rf);
             cut = interp1(linspace(0, 1, numel(rs)), rs, 0.8);
             tr = rf <= cut;
             te = ~tr;
-            if ~separated && nnz(te) >= 3 && nnz(tr) >= 5
+            if nnz(te) >= 3 && nnz(tr) >= 5
                 qTr = fit_powerlaw(rf(tr), vf(tr), wf(tr), radius, ...
                     [max(vf) 3]);
                 predA = powerlaw_v(rf(te), qTr, radius);
-                trX = [xf(tr); xWall];
-                trZ = [zf(tr); zWall];
+                trX = [xf(tr); st.xWall];
+                trZ = [zf(tr); st.zWall];
                 trV = [vf(tr); zeros(nWall, 1)];
                 itpB = scatteredInterpolant(trX, trZ, trV, 'linear', 'none');
-                xTe = xf(te); zTe = zf(te);
+                xTe = xf(te);
+                zTe = zf(te);
                 predB = itpB(xTe, zTe);
                 nb = ~isfinite(predB);
                 if any(nb)
@@ -819,22 +865,76 @@ for k = 1:max(G)
                 end
                 eA = sqrt(mean((predA - vf(te)) .^ 2));
                 eB = sqrt(mean((predB - vf(te)) .^ 2));
-                lam = eB^2 / (eA^2 + eB^2);
-            else
-                lam = 0;
-            end
-            if lam > 0
-                vModel = powerlaw_v(hypot(xg(holes), zg(holes)), qFull, ...
-                    radius);
-                fillGrid(holes) = lam * vModel + (1 - lam) * fillGrid(holes);
+                st.lam = eB^2 / (eA^2 + eB^2);
             end
         end
+    end
+    S{k} = st;
+end
+S = [S{:}];
 
-        sgGrid = local_poly_filter([xg; xWall], [zg; zWall], ...
-            [fillGrid; zeros(nWall, 1)], xg, zg, order, win, step);
-    else
-        fillGrid = nan(nGrid, 1);
+% Median over the running +/-2 slices of the same dataset and seed.
+key = strings(1, nG);
+pos = zeros(1, nG);
+for k = 1:nG
+    Q1 = P(S(k).idx(1), :);
+    key(k) = string(Q1.dataset) + "#" + string(Q1.seed_base);
+    pos(k) = Q1.slice_pos_mm;
+end
+v0s = [S.v0];
+ns = [S.n];
+lams = [S.lam];
+for u = unique(key)
+    sel = find(key == u);
+    [~, ord] = sort(pos(sel));
+    sel = sel(ord);
+    v0s(sel) = med_neighbours(v0s(sel));
+    ns(sel) = med_neighbours(ns(sel));
+    lams(sel) = med_neighbours(lams(sel));
+end
+
+% Pass 2: blend with the smoothed parameters, output smoothing, truths.
+for k = 1:nG
+    st = S(k);
+    idx = st.idx;
+    Q = P(idx, :);
+    xg = st.xg;
+    zg = st.zg;
+    nGrid = numel(xg);
+    nWall = st.nWall;
+    rawGrid = st.rawGrid;
+    fillGrid = st.fillGrid;
+    holes = ~isfinite(rawGrid);
+    separated = st.expanding && ns(k) <= 5.5;
+    if st.canFill && ~separated && isfinite(ns(k)) && ...
+            isfinite(lams(k)) && lams(k) > 0 && any(holes)
+        vModel = powerlaw_v(hypot(xg(holes), zg(holes)), ...
+            [v0s(k) ns(k)], st.radius);
+        fillGrid(holes) = lams(k) * vModel + (1 - lams(k)) * fillGrid(holes);
+    end
+    if ~st.canFill
         sgGrid = nan(nGrid, 1);
+    else
+        % SG is exact for a quadratic field and destructive for a jet
+        % cliff, so the smoothed exponent decides per slice instead of
+        % the vessel type: straight pipes fit n = 2.0-2.2 (parabola,
+        % SG is free variance reduction, raw 7.0 -> 2.7% at window 11),
+        % every stenosis slice fits n = 3.9-10 (blunt profile, SG blurs
+        % the cliff: 10.5 -> 10.8-11.2% measured, +2.3 points at the
+        % throat). 3.0 splits the observed gap; like the separation
+        % gate it is calibrated on these vessels at one seed. A slice
+        % with no profile fit falls back to the tapered-vessel proxy.
+        if isfinite(ns(k))
+            doSG = ns(k) < 3;
+        else
+            doSG = ~opts.compensate_xz;
+        end
+        if doSG
+            sgGrid = local_poly_filter([xg; st.xWall], [zg; st.zWall], ...
+                [fillGrid; zeros(nWall, 1)], xg, zg, order, win, step);
+        else
+            sgGrid = fillGrid;
+        end
     end
 
     % Two truths on the reconstruction grid. The field is compared against
@@ -843,7 +943,7 @@ for k = 1:max(G)
     % flux through a plane and only the plane version is conserved along the
     % vessel (465 +/- 4 ml/min over all 41 slices, against 452-473 for the
     % old fixed-column average).
-    y0 = Q.slice_pos_mm(1) * 1e-3;
+    y0 = st.y0;
     y1 = y0 - d.d_row / 2;
     [~, truthTransit] = src.transit_truth(ph, xg * 1e-3, zg * 1e-3, ...
         y1, y0 + d.d_row / 2, d.d_row, d.flow_direction);
@@ -858,7 +958,7 @@ for k = 1:max(G)
     P.Vy_sg_mms(idx(matched)) = sgGrid(gridRow(matched));
 
     sampleType = [repmat("grid", nGrid, 1); repmat("wall", nWall, 1)];
-    roiPresentAll = [roiPresent; false(nWall, 1)];
+    roiPresentAll = [st.roiPresent; false(nWall, 1)];
     measuredAll = [isfinite(rawGrid); false(nWall, 1)];
     area = [repmat(step^2, nGrid, 1); zeros(nWall, 1)];
     rawAll = [rawGrid; nan(nWall, 1)];
@@ -866,8 +966,8 @@ for k = 1:max(G)
     sgAll = [sgGrid; zeros(nWall, 1)];
     truthAll = [truthGrid; zeros(nWall, 1)];
     planeAll = [truthPlane; zeros(nWall, 1)];
-    xAll = [xg; xWall];
-    zAll = [zg; zWall];
+    xAll = [xg; st.xWall];
+    zAll = [zg; st.zWall];
     nAll = nGrid + nWall;
 
     out{k} = table( ...
@@ -877,7 +977,7 @@ for k = 1:max(G)
         repmat(Q.seed_base(1), nAll, 1), ...
         repmat(Q.slice_seed(1), nAll, 1), ...
         repmat(Q.vessel_region(1), nAll, 1), ...
-        repmat(radius, nAll, 1), xAll, zAll, hypot(xAll, zAll), ...
+        repmat(st.radius, nAll, 1), xAll, zAll, hypot(xAll, zAll), ...
         sampleType, roiPresentAll, measuredAll, area, rawAll, fillAll, ...
         sgAll, truthAll, planeAll, 'VariableNames', {'dataset', 'slice_idx', ...
         'slice_pos_mm', 'seed_base', 'slice_seed', 'vessel_region', ...
@@ -1232,6 +1332,20 @@ end
 
 
 % -------------------------------------------------------------------- output
+
+function s = med_neighbours(v)
+%MED_NEIGHBOURS Running median over the +/-2 neighbouring elements,
+% finite values only. NaN entries stay NaN: a slice that could not fit
+% its own profile does not inherit one from its neighbours.
+s = v;
+for i = 1:numel(v)
+    if ~isfinite(v(i))
+        continue;
+    end
+    w = v(max(1, i-2):min(numel(v), i+2));
+    s(i) = median(w(isfinite(w)));
+end
+end
 
 function v = powerlaw_v(r, q, R)
 %POWERLAW_V Blunt velocity profile v0 * (1 - (r/R)^n).
