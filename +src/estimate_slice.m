@@ -1,4 +1,4 @@
-function T = estimate_slice(data_file, phantom, opts)
+function [T, snap] = estimate_slice(data_file, phantom, opts)
 %ESTIMATE_SLICE Three-component flow estimation for one slice.
 % The per-slice estimator called by main() for every slice of a run. Core
 % primitives live alongside it in +src, plotting in +viz:
@@ -71,6 +71,19 @@ Nz = numel(d.z);
 Nx = numel(d.x);
 dt = d.dt;
 d_row = d.d_row;
+
+if nargout > 1
+    % One-frame envelope snapshot of both rows for the tissue
+    % localization stage in main -- grabbed here so the scan file is
+    % not read a second time.
+    tf = min(max(1, round(opts.loc_frame)), Nt);
+    Rw = ph.wall_radius(d.y_row1);
+    if ~isfinite(Rw)
+        Rw = d.R;
+    end
+    snap = struct('E1', E1(:, :, tf), 'E2', E2(:, :, tf), ...
+        'x', d.x, 'z', d.z, 'xc', d.xc, 'zc', d.zc, 'radius', Rw);
+end
 
 rz = round(opts.roi_half / d.dz);
 rx = round(opts.roi_half / d.dx);

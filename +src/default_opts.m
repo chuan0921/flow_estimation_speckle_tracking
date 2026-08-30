@@ -90,6 +90,25 @@ def.prom_w = 12;            % samples to each side; edge-truncated = reject.
                             % long-lag experiments silently edge-rejected a
                             % quarter of the reverse lag grid.
 def.prom_tail_min = 1200;   % forward: only gate peaks beyond this lag
+% Tissue localization (src.localize_scan). Margin in lumen radii kept
+% clear of the mask (blood moves, PSF smears ~0.5 mm past the wall),
+% spatial search range in scan steps, and the frame the snapshot is
+% taken from. The ref is ALWAYS row2 -- the sign convention lives in
+% localize_scan's help text and must not be reparameterised.
+def.loc_margin = 1.3;
+def.loc_range = 8;
+def.loc_frame = 101;
+def.loc_search_mm = 0;  % In-plane block-search half-width [mm]. 0 = plain
+                        % same-position NCC (correct while the probe only
+                        % translates -- every simulation). >0 = classic
+                        % block matching for experimental scans where
+                        % probe pressure or an uneven surface shifts the
+                        % tissue in-plane between the paired planes: each
+                        % tissue block keeps its best ZNCC within +/- this
+                        % many mm in x and z per slice offset.
+def.loc_block_mm = 2;   % Block edge [mm] in block mode.
+def.loc_blocks = 3;     % Tissue blocks; slice-offset peak is the median
+                        % across blocks and the majority must agree.
 def.nmt_thresh = 2;
 def.nmt_eps_vy = 5e-3;
 def.nmt_eps_ip = 1.5e-3;
