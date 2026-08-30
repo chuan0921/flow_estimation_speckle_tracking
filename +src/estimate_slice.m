@@ -419,6 +419,23 @@ out_g = src.nmt_outlier(Fy, opts.nmt_thresh, opts.nmt_eps_vy) | ...
 is_out = out_g(keep);
 lag_peak_frames = d_row ./ (vy_g * dt);
 
+% Peak-shape gate (opts.sharp_band, off when empty). A genuine transit
+% peak's relative width is fixed by the beam geometry: the speckle is in
+% view for ~sigma_y of its d_row flight, so curv*lag^2/cc clusters at
+% (d_row/sigma_y)^2 (~20 here) for every true peak regardless of speed.
+% Frozen-speckle plateaus land far below the band (the "peak" is the top
+% of a mesa), micro-ripple spikes far above it; both correlate well and
+% repeat, so the height/prominence gates pass them -- shape is the only
+% observable that separates them from honest slow points.
+if numel(opts.sharp_band) == 2
+    sharp_g = curv_g .* lag_peak_frames .^ 2 ./ max(abs(cc_g), eps);
+    bad = isfinite(sharp_g) & (sharp_g < opts.sharp_band(1) | ...
+        sharp_g > opts.sharp_band(2));
+    vy_g(bad) = nan;
+    cc_g(bad) = nan;
+    is_rev(bad) = false;
+end
+
 % Positions are vessel-centred in x and z, matching r_mm and the phantom.
 T = table((grid_x - d.xc) * 1e3, (grid_z - d.zc) * 1e3, r_pt * 1e3, ...
     vx_e * 1e3, vy_g * 1e3, vz_e * 1e3, ...

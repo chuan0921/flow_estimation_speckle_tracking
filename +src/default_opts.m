@@ -90,6 +90,13 @@ def.prom_w = 12;            % samples to each side; edge-truncated = reject.
                             % long-lag experiments silently edge-rejected a
                             % quarter of the reverse lag grid.
 def.prom_tail_min = 1200;   % forward: only gate peaks beyond this lag
+def.sharp_band = [];    % Peak-shape band [lo hi] for the transit peak's
+                        % dimensionless sharpness curv*lag^2/cc. Empty =
+                        % gate off (historical behaviour). A genuine peak
+                        % sits at (d_row/sigma_y)^2 ~= 20 by beam geometry;
+                        % [8 45] (~geometry x/2.2) rejects frozen-speckle
+                        % plateaus (<8) and micro-ripple spikes (>45) that
+                        % clear the cc gate with a shapeless curve.
 % Tissue localization (src.localize_scan). Margin in lumen radii kept
 % clear of the mask (blood moves, PSF smears ~0.5 mm past the wall),
 % spatial search range in scan steps, and the frame the snapshot is
