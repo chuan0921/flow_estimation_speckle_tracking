@@ -1,10 +1,11 @@
 """Figure made from metrics_slice.csv (+ vessel_regions.csv): the vessel summary.
 
 Ports the current viz.plot_metrics_vs_slice, which main() saves as
-vessel_summary.png. Five stacked panels against elevational position, every
+vessel_summary.png. Five stacked panels against slice number, every
 one of them an estimation result:
 
-    1  NRMSE over the valid ROI mask, raw vs 2-D SG
+    1  NRMSE over the valid ROI mask, raw vs final (SG only where the
+       fitted profile is quadratic-compatible)
     2  NRMSE over the full lumen (no-slip fill vs SG)
     3  flow error
     4  bias
@@ -40,7 +41,7 @@ C_GOLD = "#DB8514"      # [0.86 0.52 0.08]
 
 def plot_vessel_summary(msl, regions=None, title=""):
     m = msl.sort_values("slice_pos_mm")
-    y = m["slice_pos_mm"].to_numpy(float)
+    y = _slice_no(m)
     reg = _normalise_regions(m, regions)
     n_seeds = _col(m, "n_seeds", default=1.0)
 
@@ -55,7 +56,7 @@ def plot_vessel_summary(msl, regions=None, title=""):
                   100 * _col(m, "nrmse_raw_seed_std"), n_seeds, C_RAW, "o", "Raw")
     got |= _series(ax, y, 100 * _col(m, "nrmse_sg"),
                    100 * _col(m, "nrmse_sg_seed_std"), n_seeds, C_SG, "s",
-                   "After SG (2-D)")
+                   "Final")
     filled.append(got)
     _axis(ax, "NRMSE [%]")
     ax.legend(loc="upper left", fontsize=FS_LEGEND, frameon=False, ncols=2)
@@ -69,7 +70,7 @@ def plot_vessel_summary(msl, regions=None, title=""):
                   "o", "No-slip fill")
     got |= _series(ax, y, 100 * _col(m, "nrmse_sg_full"),
                    100 * _col(m, "nrmse_sg_full_seed_std"), n_seeds, C_SG, "s",
-                   "After SG (2-D)")
+                   "Final")
     filled.append(got)
     _axis(ax, "Full-lumen NRMSE [%]")
     ax.legend(loc="upper left", fontsize=FS_LEGEND, frameon=False, ncols=2)
@@ -104,7 +105,7 @@ def plot_vessel_summary(msl, regions=None, title=""):
     _annotate_seed_counts(ax, y, n_seeds)
     ax.set_ylim(0, 112)
     _axis(ax, "Valid ROI [%]")
-    ax.set_xlabel("Slice position [mm]", fontsize=FS_LABEL, labelpad=10)
+    ax.set_xlabel("Slice no.", fontsize=FS_LABEL, labelpad=10)
 
     runs = _region_runs(reg)
     for ax, got in zip(axes, filled):
@@ -113,6 +114,16 @@ def plot_vessel_summary(msl, regions=None, title=""):
     _label_regions(axes[0], runs)
     axes[0].set_xlim(runs[0][0], runs[-1][1])
     return fig
+
+
+def _slice_no(T):
+    """Slice number for the x axis; the mm position confused every reader.
+
+    Falls back to the rank order for tables written before slice_idx was
+    carried through."""
+    if "slice_idx" in T.columns:
+        return T["slice_idx"].to_numpy(float)
+    return np.arange(1, len(T) + 1, dtype=float)
 
 
 def _col(T, name, default=np.nan):
@@ -166,7 +177,7 @@ def _region_runs(reg):
     Edges sit halfway between neighbouring slices, so the shading tiles the
     axis without gaps or overlap.
     """
-    y = reg["slice_pos_mm"].to_numpy(float)
+    y = _slice_no(reg)
     if y.size == 1:
         edges = np.array([y[0] - 0.5, y[0] + 0.5])
     else:

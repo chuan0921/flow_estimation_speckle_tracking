@@ -20,7 +20,7 @@ Across datasets        from                              figure
   plot_valid_fraction    _summary/metrics_slice_all.csv    valid_fraction.png
   plot_nrmse_vs_speed    _summary/metrics_slice_all.csv    nrmse_vs_speed.png
   plot_est_vs_true       pooled points.csv                 est_vs_true.png
-  plot_bland_altman      pooled points.csv                 bland_altman_{raw,sg}.png
+  plot_bland_altman_slices  pooled field.csv (per slice)   bland_altman_{flow,velocity}.png
 Across speeds          from                              figure
   plot_speed_metric      several metrics_slice.csv          speed_<metric>.png
                          (viz.collect_speeds)               one metric per file,
@@ -36,7 +36,8 @@ from .roi_peak import (ZOOMS, lag_error_limit, plot_roi_peak_3x3,
                        plot_roi_peak_map, roi_peak_frame)
 from .profile import plot_error_vs_radius, plot_profile
 from .speed_compare import collect_speeds, metric_keys, plot_speed_metric
-from .summary import (plot_bland_altman, plot_est_vs_true,
+from .summary import (plot_bland_altman, plot_bland_altman_slices,
+                      plot_est_vs_true,
                       plot_nrmse_vs_speed, plot_valid_fraction)
 from .vector_field import plot_vector_field
 from .vessel_summary import plot_vessel_summary
@@ -48,6 +49,6 @@ __all__ = [
     "roi_peak_frame", "lag_error_limit", "plot_roi_peak_map",
     "plot_roi_peak_3x3",
     "plot_nrmse_vs_speed", "plot_valid_fraction", "plot_est_vs_true",
-    "plot_bland_altman",
+    "plot_bland_altman", "plot_bland_altman_slices",
     "collect_speeds", "metric_keys", "plot_speed_metric",
 ]

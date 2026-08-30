@@ -187,6 +187,58 @@ def plot_bland_altman(P, title="", hide_outliers=True, relative=False,
     return fig
 
 
+def plot_bland_altman_slices(T, value="flow", title=""):
+    """Bland-Altman with one point per slice and seed, not per grid cell.
+
+    The per-cell version drowned in ~60k points; agreement is a per-slice
+    question anyway -- does the reconstructed slice deliver the right flow
+    (or mean velocity)? T needs columns dataset, est, tru; typically 41
+    slices x seeds x speeds, a few hundred points, colored by speed.
+    value only labels the axes: "flow" [ml/min] or "velocity" [mm/s].
+    """
+    unit = "ml/min" if value == "flow" else "mm/s"
+    est = T["est"].to_numpy(float)
+    tru = T["tru"].to_numpy(float)
+    ok = np.isfinite(est) & np.isfinite(tru)
+    T, est, tru = T[ok], est[ok], tru[ok]
+    avg = (est + tru) / 2
+    dif = est - tru
+
+    bias = float(np.mean(dif))
+    sd = float(np.std(dif, ddof=1))
+    loa = (bias - 1.96 * sd, bias + 1.96 * sd)
+
+    names, speed = st.order_datasets(T["dataset"])
+    cols = st.dataset_colors(len(names))
+
+    fig = st.new_figure(st.FIG_SINGLE)
+    ax = fig.add_subplot(111)
+    for k, nm in enumerate(names):
+        sel = (T["dataset"] == nm).to_numpy()
+        ax.scatter(avg[sel], dif[sel], s=42, color=cols[k], alpha=0.75,
+                   edgecolors="none", zorder=2,
+                   label=st.speed_labels([nm], speed[k:k + 1])[0])
+    xr = (float(avg.min()), float(avg.max()))
+    ax.plot(xr, [bias, bias], "-", color=st.C_LINE, lw=2.4, zorder=3)
+    for yv in loa:
+        ax.plot(xr, [yv, yv], "--", color=st.C_LOA, lw=2.0, zorder=3)
+    lbl = ax.get_yaxis_transform()
+    ax.text(0.99, bias, f"bias {bias:.1f}", transform=lbl, ha="right",
+            va="bottom", color=st.C_LINE, fontsize=st.FS_ANNOT,
+            fontweight="bold")
+    ax.text(0.99, loa[1], f"+1.96sd {loa[1]:.1f}", transform=lbl, ha="right",
+            va="bottom", color=st.C_LOA, fontsize=st.FS_ANNOT)
+    ax.text(0.99, loa[0], f"-1.96sd {loa[0]:.1f}", transform=lbl, ha="right",
+            va="top", color=st.C_LOA, fontsize=st.FS_ANNOT)
+    st.style_axes(ax)
+    st.label_axes(ax, f"mean of estimate and truth [{unit}]",
+                  f"estimate - truth [{unit}]",
+                  f"{title}  Bland-Altman, one point per slice "
+                  f"(n = {dif.size})".strip())
+    st.legend(ax, loc="lower left")
+    return fig
+
+
 def _paired(P, hide_outliers, estimate_col="Vy_mms"):
     """Rows where estimate and truth are both finite (and not flagged).
 

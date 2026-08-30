@@ -14,6 +14,7 @@ re-rendering never needs MATLAB or a re-run of the estimation.
 from __future__ import annotations
 
 import argparse
+import numpy as np
 import glob
 import os
 
@@ -165,25 +166,40 @@ def summary_figures(results_dir, out_dir=None, title=""):
         P = pd.concat(parts, ignore_index=True)
         written.append(style.save(viz.plot_est_vs_true(P, title=title),
                                   os.path.join(out_dir, "est_vs_true.png")))
-        for col, ba_title, png in _bland_altman_variants(P):
-            written.append(style.save(
-                viz.plot_bland_altman(P, title=ba_title, estimate_col=col),
-                os.path.join(out_dir, png)))
     else:
         print(f"skip: no <dataset>/points.csv under {results_dir}")
+
+    # Bland-Altman at the per-slice scale: the per-cell clouds (60k points)
+    # were unreadable, and agreement is a per-slice question -- does each
+    # reconstructed slice deliver the right flow and mean velocity.
+    fparts = [pd.read_csv(f) for f in
+              sorted(glob.glob(os.path.join(results_dir, "*", "field.csv")))]
+    if fparts:
+        F = pd.concat(fparts, ignore_index=True)
+        F = F[F["sample_type"] == "grid"]
+        ok = np.isfinite(F["Vy_sg_mms"]) & np.isfinite(F["VyTrue_mms"]) \
+            & np.isfinite(F["VyPlaneTrue_mms"])
+        F = F[ok]
+        F["fe"] = F["Vy_sg_mms"] * F["cell_area_mm2"]
+        F["ft"] = F["VyPlaneTrue_mms"] * F["cell_area_mm2"]
+        g = F.groupby(["dataset", "slice_idx", "seed_base"])
+        agg = g.agg(fe=("fe", "sum"), ft=("ft", "sum"),
+                    ve=("Vy_sg_mms", "mean"),
+                    vt=("VyTrue_mms", "mean")).reset_index()
+        flow = agg.rename(columns={"fe": "est", "ft": "tru"})
+        flow[["est", "tru"]] *= 60.0 / 1000.0        # mm^3/s -> ml/min
+        written.append(style.save(
+            viz.plot_bland_altman_slices(flow, value="flow",
+                                         title="Flow per slice"),
+            os.path.join(out_dir, "bland_altman_flow.png")))
+        vel = agg.rename(columns={"ve": "est", "vt": "tru"})
+        written.append(style.save(
+            viz.plot_bland_altman_slices(vel, value="velocity",
+                                         title="Mean velocity per slice"),
+            os.path.join(out_dir, "bland_altman_velocity.png")))
+    else:
+        print(f"skip: no <dataset>/field.csv under {results_dir}")
     return written
-
-
-def _bland_altman_variants(P):
-    """(column, title, filename) per estimate worth a Bland-Altman panel.
-
-    main() draws the raw and post-SG estimates separately; tables written
-    before those columns existed get the single Vy_mms version.
-    """
-    want = [("Vy_raw_mms", "Raw", "bland_altman_raw.png"),
-            ("Vy_sg_mms", "After SG (2-D)", "bland_altman_sg.png")]
-    have = [w for w in want if w[0] in P.columns]
-    return have or [("Vy_mms", "", "bland_altman.png")]
 
 
 def _read(dir_path, name):
