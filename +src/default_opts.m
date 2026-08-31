@@ -47,6 +47,16 @@ def.cc_min = 0.5;           % accept only peaks that are actually locked. On
                             % empties the outer half of the lumen and drives
                             % the flow 13-27% low. 0.5 sits between them.
 def.fft_min_lags = 24;    % shift groups with >= this many lags use FFT
+def.transit_cc = 'envelope';  % 'coherent' correlates complex IQ instead of
+                            % the envelope in every transit scan. On
+                            % experimental data the inter-row envelope
+                            % correlation collapses in the fast core (the
+                            % clutter's brightness common mode swamps the
+                            % ~0.25 coherent remnant), while the complex
+                            % correlation still locks: phase-misaligned
+                            % clutter self-cancels in the coherent sum.
+                            % Simulation stays on 'envelope' (equivalent
+                            % there, and all tuning was done on it).
 def.drift_win = 3;
 def.fine_on = false;      % fine drift stage (two-grain window)
 def.fine_roi_half_x = 0.6e-3;   % half-extent: window holds two lateral grains
@@ -90,13 +100,26 @@ def.prom_w = 12;            % samples to each side; edge-truncated = reject.
                             % long-lag experiments silently edge-rejected a
                             % quarter of the reverse lag grid.
 def.prom_tail_min = 1200;   % forward: only gate peaks beyond this lag
+def.prom_abs_min = 0;       % minimum absolute peak height above the curve
+                            % median. The relative prominence test cannot
+                            % reject a flat curve with micro-ripples (its
+                            % 20%-of-nothing is satisfied by noise); static
+                            % wall-texture plateaus in experimental data
+                            % peak 0.0002-0.004 above their own median
+                            % while genuine transit peaks sit 0.02-0.3
+                            % above. 0 = off (simulation default).
 def.sharp_band = [];    % Peak-shape band [lo hi] for the transit peak's
                         % dimensionless sharpness curv*lag^2/cc. Empty =
                         % gate off (historical behaviour). A genuine peak
                         % sits at (d_row/sigma_y)^2 ~= 20 by beam geometry;
-                        % [8 45] (~geometry x/2.2) rejects frozen-speckle
-                        % plateaus (<8) and micro-ripple spikes (>45) that
-                        % clear the cc gate with a shapeless curve.
+                        % [10 45] rejects frozen-speckle plateaus and
+                        % micro-ripple spikes that clear the cc gate with a
+                        % shapeless curve. The lower edge hugs the honest
+                        % floor (straight-pipe p05 ~= 10.4): the 8-10 alley
+                        % holds mixture-widened wall liars, and clearing it
+                        % improved all seven datasets (straight 5-seed
+                        % finals another -4..-9%, sten-20 upstream
+                        % 11.3->9.5%) for 1-3pp of yield.
 % Tissue localization (src.localize_scan). Margin in lumen radii kept
 % clear of the mask (blood moves, PSF smears ~0.5 mm past the wall),
 % spatial search range in scan steps, and the frame the snapshot is
