@@ -119,19 +119,8 @@ for ds = 1:numel(sets)
 
     pts = cell(1, height(jobs));
     t0 = tic;
-    snapIdx = [];
-    snapPos = [];
-    snaps = struct('E1', {}, 'E2', {}, 'x', {}, 'z', {}, 'xc', {}, ...
-        'zc', {}, 'radius', {});
     for k = 1:height(jobs)
-        if ~ismember(jobs.slice_idx(k), snapIdx)
-            [Ti, sn] = src.estimate_slice(char(jobs.file(k)), phantom, opts);
-            snapIdx(end+1) = jobs.slice_idx(k); %#ok<AGROW>
-            snapPos(end+1) = jobs.slice_pos_mm(k); %#ok<AGROW>
-            snaps(end+1) = sn; %#ok<AGROW>
-        else
-            Ti = src.estimate_slice(char(jobs.file(k)), phantom, opts);
-        end
+        Ti = src.estimate_slice(char(jobs.file(k)), phantom, opts);
         Ti = apply_lr_table(Ti, opts, char(jobs.file(k)));
         ir = find(regions.slice_idx == jobs.slice_idx(k), 1);
         Ti.dataset = repmat(string(name), height(Ti), 1);
@@ -159,36 +148,6 @@ for ds = 1:numel(sets)
         phantom, char(jobs.file(1)), opts);
     fprintf('  %d slice/seed run(s), %d slice(s), in %.0f s\n', ...
         height(jobs), numel(unique(jobs.slice_idx)), toc(t0));
-
-    % Tissue localization: the static background is the position
-    % reference (direction + probe step per scan step). Report-only by
-    % design -- the truth comparison downstream keeps using the manifest
-    % positions, so localization error never leaks into the velocity
-    % error budget; the 3-D assembly in viz is the consumer. Skipped
-    % automatically when there is nothing outside the lumen to lock
-    % onto (the clean simulations).
-    if numel(snaps) >= 5
-        [ord, ~] = sort_snaps(snapPos);
-        [hasTissue, eRatio] = tissue_present(snaps(ord(1)), opts);
-        if hasTissue
-            dl = load(char(jobs.file(1)), 'd_row', 'y_row1', 'y_row2');
-            Lloc = src.localize_scan(snaps(ord), dl.d_row, opts);
-            Lloc.slice_idx = snapIdx(ord)';
-            Lloc.slice_pos_mm = snapPos(ord)';
-            writetable(Lloc, fullfile(outDir, 'localization.csv'));
-            ok = isfinite(Lloc.step_mm);
-            trueStep = mean(diff(snapPos(ord)));
-            trueDir = sign(trueStep) * sign(dl.y_row2 - dl.y_row1);
-            nDirOk = nnz(Lloc.direction(ok) == trueDir);
-            fprintf(['  localization: dir %+d (%d/%d agree), step ' ...
-                '%.4f +/- %.4f mm (manifest %.4f)\n'], trueDir, ...
-                nDirOk, nnz(ok), mean(Lloc.step_mm(ok)), ...
-                std(Lloc.step_mm(ok)), abs(trueStep));
-        else
-            fprintf(['  localization: skipped, tissue/lumen energy ' ...
-                'ratio %.3f\n'], eRatio);
-        end
-    end
 
     prof = build_profile(F);
     mseed = seed_slice_metrics(P, F);
@@ -1387,25 +1346,6 @@ for i = 1:numel(v)
     s(i) = median(w(isfinite(w)));
 end
 end
-
-function [ord, pos] = sort_snaps(snapPos)
-%SORT_SNAPS Acquisition order of the snapshots along the scan.
-[pos, ord] = sort(snapPos);
-end
-
-
-function [ok, ratio] = tissue_present(snap, opts)
-%TISSUE_PRESENT Is there enough echo outside the lumen to localize on?
-% Clean simulations seed scatterers in the lumen only; their outside is
-% numerically empty and the correlation would lock onto nothing.
-[X, Z] = meshgrid(snap.x, snap.z);
-rr = hypot(X - snap.xc, Z - snap.zc);
-vIn = mean(snap.E1(rr < 0.8 * snap.radius));
-vOut = mean(snap.E1(rr > opts.loc_margin * snap.radius));
-ratio = double(vOut) / max(double(vIn), eps);
-ok = ratio > 0.05;
-end
-
 
 function v = powerlaw_v(r, q, R)
 %POWERLAW_V Blunt velocity profile v0 * (1 - (r/R)^n).
