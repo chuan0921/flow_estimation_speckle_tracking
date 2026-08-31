@@ -1131,15 +1131,21 @@ for k = 1:n
     % integrates the transit truth over the same cells, which separates the
     % method's own bias -- the estimator reports a transit average where the
     % flux wants a plane value -- from the estimation error.
-    mq = isfinite(R.Vy_fill_mms) & isfinite(R.Vy_sg_mms) & ...
-        isfinite(R.VyPlaneTrue_mms);
+    % The measured flow must not be gated on truth: experimental data has
+    % none, and the integral is a pure measurement. On simulations the
+    % plane truth is finite across the lumen, so the masks coincide.
+    mq = isfinite(R.Vy_fill_mms) & isfinite(R.Vy_sg_mms);
     if any(mq)
         area = R.cell_area_mm2(mq);
         flowFill(k) = sum(R.Vy_fill_mms(mq) .* area) * 0.06;
         flowSg(k) = sum(R.Vy_sg_mms(mq) .* area) * 0.06;
-        flowTruth(k) = sum(R.VyPlaneTrue_mms(mq) .* area) * 0.06;
+        pt = R.VyPlaneTrue_mms(mq);
+        flowTruth(k) = sum(pt(isfinite(pt)) .* area(isfinite(pt))) * 0.06;
         tt = R.VyTrue_mms(mq);
         flowTransit(k) = sum(tt(isfinite(tt)) .* area(isfinite(tt))) * 0.06;
+        if ~any(isfinite(pt))
+            flowTruth(k) = nan;
+        end
         if abs(flowTruth(k)) >= eps
             flowErrFill(k) = 100 * (flowFill(k) - flowTruth(k)) / ...
                 abs(flowTruth(k));
