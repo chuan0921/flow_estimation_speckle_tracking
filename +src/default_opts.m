@@ -108,6 +108,10 @@ def.prom_abs_min = 0;       % minimum absolute peak height above the curve
                             % peak 0.0002-0.004 above their own median
                             % while genuine transit peaks sit 0.02-0.3
                             % above. 0 = off (simulation default).
+def.wall_margin_mm = 0; % Wall clearance [mm]: exclude ROIs whose centre is
+                        % within this distance of the local wall, so no
+                        % window straddles it (0.25 = the ROI half-width).
+                        % 0 = off (historical lattice-to-the-wall).
 def.sharp_band = [];    % Peak-shape band [lo hi] for the transit peak's
                         % dimensionless sharpness curv*lag^2/cc. Empty =
                         % gate off (historical behaviour). A genuine peak

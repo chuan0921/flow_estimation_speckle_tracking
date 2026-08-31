@@ -43,6 +43,17 @@ gv = (-k:k) * opts.grid_step;
 [GX, GZ] = meshgrid(gv, gv);
 
 keep = roi_energy_gate(d, opts, GX, GZ, R1);
+if opts.wall_margin_mm > 0
+    % Wall clearance: drop ROIs whose window overlaps the wall. A window
+    % straddling the wall is a structural mixture -- part slow near-wall
+    % blood, part smeared-in faster neighbours, part dark exterior -- and
+    % every surviving address-error liar lived in this ring (100% of them
+    % across all five validation datasets, at 0.1-4.5% honest collateral
+    % whose own median error was 16-42%). The wall's velocity is the
+    % no-slip anchor's job, not a straddling window's. Uses the row1 wall
+    % radius, so the ring follows the taper.
+    keep = keep & hypot(GX, GZ) <= R1 - opts.wall_margin_mm * 1e-3;
+end
 grid_x = GX(keep) + d.xc;
 grid_z = GZ(keep) + d.zc;
 end
