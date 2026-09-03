@@ -85,7 +85,16 @@ def.vy_fine_roi_half_z = 0.15e-3; % one axial grain half-extent
 % remaining ring bias then matches the physical window-mixture model, so
 % the averaging was the missing mechanism, not a noise suppressor.
 def.vy_spatial_half = 0;
-def.scan_reverse = 'auto';  % auto follows phantom, then rev_y_mm
+def.scan_reverse = false;   % Reverse fallback OFF (was 'auto'). Its gates
+                            % (significance only, no cc_min / abs
+                            % prominence) admit noise bumps from exactly
+                            % the windows whose forward scan failed: on
+                            % sten20 downstream, 126 reverse answers (11%
+                            % of valid points) carried 99% of the squared
+                            % error, median |err| 141 mm/s vs 2 mm/s for
+                            % forward answers. Holes go to the fill
+                            % instead. Re-enable via 'auto'/true once the
+                            % M4 rework gives it forward-grade gating.
 def.rev_y_mm = 3.5;         % auto: scan reverse when slice_pos >= this
 def.rev_vy_max = 0.15;      % max plausible reverse speed [m/s]
 def.z_sig_rev = 2.2;        % significance gates for the reverse peak
@@ -108,10 +117,13 @@ def.prom_abs_min = 0;       % minimum absolute peak height above the curve
                             % peak 0.0002-0.004 above their own median
                             % while genuine transit peaks sit 0.02-0.3
                             % above. 0 = off (simulation default).
-def.wall_margin_mm = 0; % Wall clearance [mm]: exclude ROIs whose centre is
-                        % within this distance of the local wall, so no
+def.wall_margin_mm = 0.25; % Wall clearance [mm]: exclude ROIs whose centre
+                        % is within this distance of the local wall, so no
                         % window straddles it (0.25 = the ROI half-width).
-                        % 0 = off (historical lattice-to-the-wall).
+                        % This is the adopted final config: 100% of the
+                        % surviving fake points across five validation
+                        % datasets lived in this ring. 0 restores the
+                        % historical lattice-to-the-wall for ablations.
 def.sharp_band = [];    % Peak-shape band [lo hi] for the transit peak's
                         % dimensionless sharpness curv*lag^2/cc. Empty =
                         % gate off (historical behaviour). A genuine peak
