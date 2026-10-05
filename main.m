@@ -814,9 +814,15 @@ for k = 1:nG
         % when allowed) -- so expansion only disqualifies the model once
         % the measured profile itself has relaxed: the fitted exponent
         % stays blunt (n = 6.4-9.7) while attached and drops to 4.6-5.0
-        % when separation appears. 5.5 splits that gap; calibrated on
-        % this vessel at one seed, the constant to watch in multi-seed
-        % runs.
+        % when separation appears. 5.5 split that gap on the 80 cm/s
+        % calibration; the three-speed run (sten_norev_v2, seed 100)
+        % showed it fires 1-3 slices early because a slow jet is rounder
+        % everywhere (n runs lower at 20 cm/s): the truth crossover where
+        % interpolation starts beating the model sits at n = 4.4 (20),
+        % 5.1 (50), 5.1 (80). Lowering the switch to 5.0 only moved the
+        % step one slice later (sten_ngate50), so the gate is now a ramp
+        % over n = 4.5..5.5 applied in pass 2 below. Calibrated on one
+        % vessel at one seed; the constants to watch in multi-seed runs.
         fd = d.flow_direction;
         rev = (isnumeric(fd) && ~isempty(fd) && fd(1) < 0) || ...
             (~isnumeric(fd) && strcmpi(strtrim(char(fd)), 'row2_to_row1'));
@@ -905,12 +911,28 @@ for k = 1:nG
     rawGrid = st.rawGrid;
     fillGrid = st.fillGrid;
     holes = ~isfinite(rawGrid);
-    separated = st.expanding && ns(k) <= 5.5;
-    if st.canFill && ~separated && isfinite(ns(k)) && ...
-            isfinite(lams(k)) && lams(k) > 0 && any(holes)
+    % Separation gate as a ramp, not a switch: in the expanding section
+    % the exam weight is scaled by w(n) = (n - 4.5) / 1.0 clamped to
+    % [0 1], so the model retires over ~3 slices (n falls ~0.3 per slice)
+    % instead of in one. The switch form (n <= 5.0 -> model off) left a
+    % one-slice step of -10..-14% flow at the handover (20/50/80 cm/s:
+    % sl26 / sl31 / sl33-34) because the exam lambda sits at 0.94-0.99
+    % right up to the gate -- the held-out points live in the core, where
+    % the model is still right. Band 4.5-5.5 spans the truth crossovers
+    % (n = 4.4 / 5.1 / 5.1 at 20 / 50 / 80); mid-band 5.0 keeps the old
+    % threshold. Model and interpolation err in opposite directions in
+    % the band, so the mix is expected to land within +/-5% there and
+    % leave every other slice unchanged. Empirical soft gate; verify on
+    % unseen seeds before trusting it beyond this vessel.
+    wSep = 1;
+    if st.expanding && isfinite(ns(k))
+        wSep = min(max((ns(k) - 4.5) / (5.5 - 4.5), 0), 1);
+    end
+    lamEff = lams(k) * wSep;
+    if st.canFill && isfinite(ns(k)) && isfinite(lamEff) && lamEff > 0 && any(holes)
         vModel = powerlaw_v(hypot(xg(holes), zg(holes)), ...
             [v0s(k) ns(k)], st.radius);
-        fillGrid(holes) = lams(k) * vModel + (1 - lams(k)) * fillGrid(holes);
+        fillGrid(holes) = lamEff * vModel + (1 - lamEff) * fillGrid(holes);
     end
     if ~st.canFill
         sgGrid = nan(nGrid, 1);
