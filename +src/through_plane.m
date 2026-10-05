@@ -33,7 +33,11 @@ function [cc, cca, ccb] = scan_transit_lags(An, E2, iz0, ix0, rz, rx, ...
 % sliced dot products); small groups stay on the direct path.
 % Optional outputs cca/ccb are the first/second-half pair means (for
 % reproducibility gating); requesting them forces the direct path.
+% Complex (coherent) input correlates conj(An).*Bn and reports the modulus
+% of the coherent pair mean; real (envelope) input keeps the signed mean,
+% bit-identical to the historical behaviour.
 want_halves = nargout > 1;
+coherent = ~isreal(An);
 cc = nan(size(lags));
 cca = nan(size(lags));
 ccb = nan(size(lags));
@@ -56,24 +60,28 @@ for g = 1:size(G, 1)
             AnF = conj(fft(An, M, 2));
         end
         S = sum(AnF .* fft(Bn, M, 2), 1);
-        r = ifft(S, [], 2, 'symmetric');   % r(L+1) = pair sum at lag L
+        if coherent
+            r = ifft(S, [], 2);            % r(L+1) = coherent pair sum at L
+        else
+            r = ifft(S, [], 2, 'symmetric'); % r(L+1) = pair sum at lag L
+        end
         for il = idx
             L = lags(il);
-            cc(il) = r(L + 1) / (Nt - L);
+            cc(il) = abs_if(coherent, r(L + 1)) / (Nt - L);
         end
     else
         for il = idx
             L = lags(il);
             if L >= 0
-                c = sum(An(:, 1:Nt - L) .* Bn(:, 1 + L:Nt), 1);
+                c = sum(conj(An(:, 1:Nt - L)) .* Bn(:, 1 + L:Nt), 1);
             else
-                c = sum(An(:, 1 - L:Nt) .* Bn(:, 1:Nt + L), 1);
+                c = sum(conj(An(:, 1 - L:Nt)) .* Bn(:, 1:Nt + L), 1);
             end
-            cc(il) = mean(c);
+            cc(il) = abs_if(coherent, mean(c));
             if want_halves
                 h = floor(numel(c) / 2);
-                cca(il) = mean(c(1:h));
-                ccb(il) = mean(c(h + 1:end));
+                cca(il) = abs_if(coherent, mean(c(1:h)));
+                ccb(il) = abs_if(coherent, mean(c(h + 1:end)));
             end
         end
     end
@@ -81,6 +89,13 @@ end
 cc = double(cc);
 cca = double(cca);
 ccb = double(ccb);
+end
+
+function v = abs_if(coherent, v)
+%ABS_IF Modulus for the coherent path, signed passthrough for envelopes.
+if coherent
+    v = abs(v);
+end
 end
 
 function cc = scan_transit_lags_spatial(E1, E2, iz0, ix0, rz, rx, ...
@@ -138,7 +153,7 @@ ok = left <= need && right <= need;
 end
 
 function [vy, pk, shape] = pick_peak(cc, lags, d_row, dt, cc_min, ...
-    prom_frac, prom_w, prom_tail_min)
+    prom_frac, prom_w, prom_tail_min, prom_abs_min)
 %PICK_PEAK Global peak with cc_min gate, interior only, local-step
 % parabolic subframe interpolation (valid on non-uniform lag axes).
 % Optional prominence gate for long-lag peaks only (frozen-speckle
@@ -175,6 +190,12 @@ if pval < cc_min || j == 1 || j == numel(lags)
 end
 if nargin >= 8 && abs(lags(j)) >= prom_tail_min && ...
         ~prominence_ok(cc, j, prom_frac, prom_w)
+    return;
+end
+% Absolute prominence: a flat curve's micro-ripple passes the relative
+% test above, but its peak barely clears the curve median.
+if nargin >= 9 && prom_abs_min > 0 && ...
+        pval - median(cc(isfinite(cc))) < prom_abs_min
     return;
 end
 den = cc(j - 1) - 2 * cc(j) + cc(j + 1);

@@ -66,6 +66,46 @@ IQ1 = d.iq_row1;                       % complex single, for vz phase
 IQ2 = d.iq_row2;
 E1 = abs(IQ1);                         % single envelopes throughout
 E2 = abs(IQ2);
+% Transit scans correlate T1 against T2. Envelope mode is the historical
+% path; coherent mode hands the complex IQ to the same scans, where
+% scan_transit_lags switches to conj-products and a modulus peak.
+if strcmpi(opts.transit_cc, 'coherent')
+    T1 = IQ1;
+    T2 = IQ2;
+else
+    T1 = E1;
+    T2 = E2;
+end
+% Slow-time clutter filter on the transit input only. The energy gate and
+% the geometry keep the RAW envelopes: tissue must stay bright for the
+% outside-vs-inside energy ratio to mean anything. Static phantom +
+% steady flow makes the clutter each pixel's slow-time DC, so the mean
+% is the whole filter; blood decorrelates in a few frames and loses
+% nothing to a 500-frame mean.
+if strcmpi(opts.slow_time_filter, 'mean')
+    T1 = T1 - mean(T1, 3);
+    T2 = T2 - mean(T2, 3);
+elseif strcmpi(opts.slow_time_filter, 'svd_ghost')
+    % SVD cut, then cancel the simultaneous-TX mid-plane cohort: by
+    % reciprocity the TX1xRX2 / TX2xRX1 components are the same image in
+    % both rows, so the per-pixel slow-time projection of one row onto the
+    % other estimates the shared part; subtracting it removes the part of
+    % the ghost the two rows agree on (a partial cure: aperture and
+    % registration differences hide the rest). Diagnostic mode.
+    T1 = svd_cut(T1, opts.svd_ncut);
+    T2 = svd_cut(T2, opts.svd_ncut);
+    c1 = sum(T1 .* conj(T2), 3) ./ sum(abs(T2).^2, 3);
+    c2 = sum(T2 .* conj(T1), 3) ./ sum(abs(T1).^2, 3);
+    [T1, T2] = deal(T1 - c1 .* T2, T2 - c2 .* T1);
+elseif strcmpi(opts.slow_time_filter, 'svd')
+    % Vibrating tissue is not slow-time DC, but it IS spatially synchronous:
+    % the whole field moves with the pump, so it lives in the first few
+    % singular components of the Casorati matrix, while blood decorrelates
+    % across space and spreads over the tail. Cutting svd_ncut components
+    % per row removes DC and vibration together.
+    T1 = svd_cut(T1, opts.svd_ncut);
+    T2 = svd_cut(T2, opts.svd_ncut);
+end
 Nt = d.Nt;
 Nz = numel(d.z);
 Nx = numel(d.x);
@@ -74,6 +114,9 @@ d_row = d.d_row;
 
 rz = round(opts.roi_half / d.dz);
 rx = round(opts.roi_half / d.dx);
+% Constant arrival displacement of the row2 pattern (tilted tube), px.
+ob_x = round(opts.row2_offset_mm(1) * 1e-3 / d.dx);
+ob_z = round(opts.row2_offset_mm(2) * 1e-3 / d.dz);
 [grid_x, grid_z, keep, GX, GZ, R_loc, ysp] = src.geometry(d, ph, opts); %#ok<ASGLU>
 nP = numel(grid_x);
 ix0v = round((grid_x - d.x(1)) / d.dx) + 1;
@@ -155,12 +198,12 @@ t_stage = zeros(1, 5);         % rough / inplane / scanA / stageB / reverse
 for p = 1:nP
     iz0 = iz0v(p);
     ix0 = ix0v(p);
-    An = tp.normalize_patch(E1, iz0, ix0, rz, rx, Nt);
+    An = tp.normalize_patch(T1, iz0, ix0, rz, rx, Nt);
 
     if compensate_xz
         % 0a: rough vy for the in-plane lag cap.
         t0 = tic;
-        cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, ...
+        cc = tp.scan_transit_lags(An, T2, iz0, ix0, rz, rx, Nt, ...
             lags_coarse, zshift, zshift, Nz, Nx, opts.fft_min_lags);
         [vy_rough, ~] = tp.pick_peak(cc, lags_coarse, d_row, dt, 0.15);
         cap = max(lag_ip);
@@ -220,14 +263,15 @@ for p = 1:nP
     t0 = tic;
     cap_z = opts.xz_shift_max_ratio * d_row / d.dz;
     cap_x = opts.xz_shift_max_ratio * d_row / d.dx;
-    oz = min(max(vzc * lags_f * dt / d.dz, -cap_z), cap_z);
-    ox = min(max(vxc * lags_f * dt / d.dx, -cap_x), cap_x);
-    [vy_g(p), cc_g(p), shp] = stage_a_pick(tp, opts, An, E2, iz0, ...
+    oz = min(max(vzc * lags_f * dt / d.dz, -cap_z), cap_z) + ob_z;
+    ox = min(max(vxc * lags_f * dt / d.dx, -cap_x), cap_x) + ob_x;
+    use_base = ob_x ~= 0 || ob_z ~= 0;
+    [vy_g(p), cc_g(p), shp] = stage_a_pick(tp, opts, An, T2, iz0, ...
         ix0, rz, rx, Nt, lags_f, oz, ox, Nz, Nx, d_row, dt);
     best_g(p) = shp.best;
     curv_g(p) = shp.curv;
-    if vxc ~= 0 || vzc ~= 0
-        [vy_0, cc_0, shp0] = stage_a_pick(tp, opts, An, E2, iz0, ...
+    if vxc ~= 0 || vzc ~= 0 || use_base
+        [vy_0, cc_0, shp0] = stage_a_pick(tp, opts, An, T2, iz0, ...
             ix0, rz, rx, Nt, lags_f, zshift_f, zshift_f, ...
             Nz, Nx, d_row, dt);
         if ~isnan(vy_0) && (isnan(vy_g(p)) || cc_0 > cc_g(p))
@@ -237,6 +281,7 @@ for p = 1:nP
             curv_g(p) = shp0.curv;
             vxc = 0;              % stage B and the reverse scan follow suit
             vzc = 0;
+            use_base = false;
             shifted(p) = false;
         end
     end
@@ -249,7 +294,7 @@ for p = 1:nP
     % shift to within the fit noise. Constant over lags. Skipped when it
     % is too small to differ from the zero candidate.
     if compensate_xz && hypot(ox_geo(p), oz_geo(p)) > 0.5
-        [vy_gm, cc_gm, shpg] = stage_a_pick(tp, opts, An, E2, iz0, ...
+        [vy_gm, cc_gm, shpg] = stage_a_pick(tp, opts, An, T2, iz0, ...
             ix0, rz, rx, Nt, lags_f, ...
             repmat(oz_geo(p), size(lags_f)), ...
             repmat(ox_geo(p), size(lags_f)), Nz, Nx, d_row, dt);
@@ -272,7 +317,7 @@ for p = 1:nP
             t0 = tic;
             oz = min(max(vzc * lags_r * dt / d.dz, -cap_z), cap_z);
             ox = min(max(vxc * lags_r * dt / d.dx, -cap_x), cap_x);
-            [ccr, ccra, ccrb] = tp.scan_transit_lags(An, E2, iz0, ix0, ...
+            [ccr, ccra, ccrb] = tp.scan_transit_lags(An, T2, iz0, ix0, ...
                 rz, rx, Nt, lags_r, oz, ox, Nz, Nx, opts.fft_min_lags);
             [vy_r, cc_r] = tp.pick_significant(ccr, ccra, ccrb, lags_r, ...
                 d_row, dt, opts);
@@ -291,12 +336,13 @@ for p = 1:nP
     if ~compensate_xz
         t0 = tic;
         if opts.vy_fine_on
-            cc = tp.scan_transit_lags_spatial(E1, E2, iz0, ix0, ...
-                rz_vy, rx_vy, Nt, lags_f, zshift_f, zshift_f, Nz, Nx, ...
-                opts.fft_min_lags, opts.vy_spatial_half);
+            cc = tp.scan_transit_lags_spatial(T1, T2, iz0, ix0, ...
+                rz_vy, rx_vy, Nt, lags_f, ...
+                zshift_f + use_base * ob_z, zshift_f + use_base * ob_x, ...
+                Nz, Nx, opts.fft_min_lags, opts.vy_spatial_half);
             [vy_2, cc_2, shp2] = tp.pick_peak(cc, lags_f, d_row, dt, ...
                 opts.cc_min, opts.prom_frac, opts.prom_w, ...
-                opts.prom_tail_min);
+                opts.prom_tail_min, opts.prom_abs_min);
             if ~isnan(vy_2)
                 vy_g(p) = vy_2;
                 cc_g(p) = cc_2;
@@ -316,7 +362,14 @@ for p = 1:nP
     w2 = opts.drift_win + ceil(L_pk / 800);
     ctr_z = vzc * L_pk * dt / d.dz;
     ctr_x = vxc * L_pk * dt / d.dx;
-    [ox_t, oz_t, pk_d] = tp.drift_match(An, E2, iz0, ix0, rz, rx, L_pk, ...
+    % Drift matching is a spatial envelope search; in coherent mode An is
+    % complex, so hand it a fresh envelope patch instead.
+    if isreal(An)
+        AnB = An;
+    else
+        AnB = tp.normalize_patch(E1, iz0, ix0, rz, rx, Nt);
+    end
+    [ox_t, oz_t, pk_d] = tp.drift_match(AnB, E2, iz0, ix0, rz, rx, L_pk, ...
         ctr_z, ctr_x, w2, Nt, Nz, Nx);
     cc_B(p) = pk_d;
     if ~isnan(ox_t)
@@ -341,15 +394,16 @@ for p = 1:nP
         oz = vz_r * lags_f * dt / d.dz;
         ox = vx_r * lags_f * dt / d.dx;
         if opts.vy_fine_on
-            cc = tp.scan_transit_lags_spatial(E1, E2, iz0, ix0, rz_vy, rx_vy, ...
+            cc = tp.scan_transit_lags_spatial(T1, T2, iz0, ix0, rz_vy, rx_vy, ...
                 Nt, lags_f, oz, ox, Nz, Nx, opts.fft_min_lags, ...
                 opts.vy_spatial_half);
         else
-            cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, lags_f, ...
+            cc = tp.scan_transit_lags(An, T2, iz0, ix0, rz, rx, Nt, lags_f, ...
                 oz, ox, Nz, Nx, opts.fft_min_lags);
         end
         [vy_2, cc_2, shp2] = tp.pick_peak(cc, lags_f, d_row, dt, ...
-            opts.cc_min, opts.prom_frac, opts.prom_w, opts.prom_tail_min);
+            opts.cc_min, opts.prom_frac, opts.prom_w, opts.prom_tail_min, ...
+            opts.prom_abs_min);
         if ~isnan(vy_2)
             vy_g(p) = vy_2;
             cc_g(p) = cc_2;
@@ -453,7 +507,7 @@ function [vy, pkv, shp] = stage_a_pick(tp, opts, An, E2, iz0, ix0, ...
 cc = tp.scan_transit_lags(An, E2, iz0, ix0, rz, rx, Nt, lags, oz, ox, ...
     Nz, Nx, opts.fft_min_lags);
 [vy, pkv, shp] = tp.pick_peak(cc, lags, d_row, dt, opts.cc_min, ...
-    opts.prom_frac, opts.prom_w, opts.prom_tail_min);
+    opts.prom_frac, opts.prom_w, opts.prom_tail_min, opts.prom_abs_min);
 end
 
 
@@ -511,4 +565,13 @@ end
 error('src:estimate_slice:badPhantom', ...
     ['Unrecognised second argument: a struct with neither a velocity ' ...
      'handle (phantom) nor grid_Uy (CFD solution).']);
+end
+
+function F = svd_cut(F, k)
+%SVD_CUT Remove the first k singular components of the Casorati matrix.
+[Nz, Nx, Nt] = size(F);
+C = reshape(F, [], Nt);
+[U, S, V] = svd(C, 'econ');
+C = C - U(:, 1:k) * S(1:k, 1:k) * V(:, 1:k)';
+F = reshape(C, Nz, Nx, Nt);
 end

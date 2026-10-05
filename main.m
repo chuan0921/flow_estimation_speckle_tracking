@@ -120,7 +120,17 @@ for ds = 1:numel(sets)
     pts = cell(1, height(jobs));
     t0 = tic;
     for k = 1:height(jobs)
-        Ti = src.estimate_slice(char(jobs.file(k)), phantom, opts);
+        % Per-slice arrival offset (tilted tube): rows are [slice dx dz],
+        % overriding row2_offset_mm for that slice. The offset still races
+        % the zero shift per ROI inside the estimator.
+        oSlice = opts;
+        if isfield(opts, 'row2_offset_table') && ~isempty(opts.row2_offset_table)
+            tr = find(opts.row2_offset_table(:, 1) == jobs.slice_idx(k), 1);
+            if ~isempty(tr)
+                oSlice.row2_offset_mm = opts.row2_offset_table(tr, 2:3);
+            end
+        end
+        Ti = src.estimate_slice(char(jobs.file(k)), phantom, oSlice);
         Ti = apply_lr_table(Ti, opts, char(jobs.file(k)));
         ir = find(regions.slice_idx == jobs.slice_idx(k), 1);
         Ti.dataset = repmat(string(name), height(Ti), 1);

@@ -57,6 +57,26 @@ def.transit_cc = 'envelope';  % 'coherent' correlates complex IQ instead of
                             % clutter self-cancels in the coherent sum.
                             % Simulation stays on 'envelope' (equivalent
                             % there, and all tuning was done on it).
+def.row2_offset_mm = [0 0]; % Constant in-plane displacement [dx dz] of the
+                            % blood's arrival in row2, in mm (a tube oblique
+                            % to the elevation axis translates the whole
+                            % pattern by the vector between the two rows'
+                            % lumen centres). Raced against the zero shift
+                            % per ROI; the better correlation wins. [0 0] off.
+def.slow_time_filter = 'none';  % 'mean' subtracts each pixel's slow-time
+                            % mean from the transit-scan input (clutter
+                            % filter for experimental data: static
+                            % phantom clutter pads the CC curve into a
+                            % 0.5+ plateau that buries the transit peak;
+                            % removing it restores an isolated peak over
+                            % a ~0.05 floor). Gates and geometry keep the
+                            % raw envelopes. Simulation default: off.
+def.svd_ncut = 2;           % 'svd' slow_time_filter: singular components
+                            % removed from each row's Casorati matrix.
+                            % Vibration on 260904-f378 lived entirely in the
+                            % first two (tissue coherence 0.85 -> 0.16,
+                            % plateau fakes died, centre transit cc 0.42 ->
+                            % 0.54); k=4/8 only shaved the true peak.
 def.drift_win = 3;
 def.fine_on = false;      % fine drift stage (two-grain window)
 def.fine_roi_half_x = 0.6e-3;   % half-extent: window holds two lateral grains
