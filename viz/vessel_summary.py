@@ -30,8 +30,10 @@ FS_LABEL = 18
 FS_LEGEND = 16
 FS_ANNOT = 14
 
-C_RAW = "#2966AD"       # [0.16 0.40 0.68]
-C_SG = "#D13D26"        # [0.82 0.24 0.15]
+C_RAW = "#D13D26"       # warm red: the comparison series (Raw)
+C_SG = "#2966AD"        # cool blue: the Final series, cool in every panel
+                        # so warm-vs-cool separates each bar pair at a glance
+                        # (No-slip fill keeps the warm gold below)
 C_GRAY = "#59616B"      # [0.35 0.38 0.42]
 C_GOLD = "#DB8514"      # [0.86 0.52 0.08]
 
@@ -53,12 +55,16 @@ def plot_vessel_summary(msl, regions=None, title=""):
     # 1 NRMSE over the valid mask
     ax = axes[0]
     got = _series(ax, y, 100 * _col(m, "nrmse_raw"),
-                  100 * _col(m, "nrmse_raw_seed_std"), n_seeds, C_RAW, "o", "Raw")
+                  100 * _col(m, "nrmse_raw_seed_std"), n_seeds, C_RAW, "left", "Raw")
     got |= _series(ax, y, 100 * _col(m, "nrmse_sg"),
-                   100 * _col(m, "nrmse_sg_seed_std"), n_seeds, C_SG, "s",
+                   100 * _col(m, "nrmse_sg_seed_std"), n_seeds, C_SG, "right",
                    "Final")
     filled.append(got)
     _axis(ax, "NRMSE [%]")
+    # Fixed error scales so the three speed conditions read against the
+    # same ruler (0-30 % NRMSE, +/-30 % flow); autoscale made a 15 % and
+    # a 25 % panel look identical.
+    ax.set_ylim(0, 30)
     ax.legend(loc="upper left", fontsize=FS_LEGEND, frameon=False, ncols=2)
     # Extra pad leaves room for the region strip between title and axes.
     st.set_title(ax, f"{title}  vessel-region error summary".strip(), pad=38)
@@ -67,12 +73,13 @@ def plot_vessel_summary(msl, regions=None, title=""):
     ax = axes[1]
     got = _series(ax, y, 100 * _col(m, "nrmse_fill_full"),
                   100 * _col(m, "nrmse_fill_full_seed_std"), n_seeds, C_GOLD,
-                  "o", "No-slip fill")
+                  "left", "No-slip fill")
     got |= _series(ax, y, 100 * _col(m, "nrmse_sg_full"),
-                   100 * _col(m, "nrmse_sg_full_seed_std"), n_seeds, C_SG, "s",
+                   100 * _col(m, "nrmse_sg_full_seed_std"), n_seeds, C_SG, "right",
                    "Final")
     filled.append(got)
     _axis(ax, "Full-lumen NRMSE [%]")
+    ax.set_ylim(0, 30)
     ax.legend(loc="upper left", fontsize=FS_LEGEND, frameon=False, ncols=2)
 
     # 3 flow error
@@ -80,20 +87,21 @@ def plot_vessel_summary(msl, regions=None, title=""):
     ax.axhline(0, color="#262626", lw=1.4, zorder=2)
     got = _series(ax, y, _col(m, "flow_error_fill_pct"),
                   _col(m, "flow_error_fill_pct_seed_std"), n_seeds, C_GOLD,
-                  "o", None)
+                  "left", None)
     got |= _series(ax, y, _col(m, "flow_error_sg_pct"),
-                   _col(m, "flow_error_sg_pct_seed_std"), n_seeds, C_SG, "s",
+                   _col(m, "flow_error_sg_pct_seed_std"), n_seeds, C_SG, "right",
                    None)
     filled.append(got)
     _axis(ax, "Flow error [%]")
+    ax.set_ylim(-30, 30)
 
     # 4 bias
     ax = axes[3]
     ax.axhline(0, color="#262626", lw=1.4, zorder=2)
     got = _series(ax, y, _col(m, "bias_raw_mms"), _col(m, "bias_raw_seed_std_mms"),
-                  n_seeds, C_RAW, "o", None)
+                  n_seeds, C_RAW, "left", None)
     got |= _series(ax, y, _col(m, "bias_sg_mms"), _col(m, "bias_sg_seed_std_mms"),
-                   n_seeds, C_SG, "s", None)
+                   n_seeds, C_SG, "right", None)
     filled.append(got)
     _axis(ax, "Bias [mm/s]")
 
@@ -101,7 +109,7 @@ def plot_vessel_summary(msl, regions=None, title=""):
     ax = axes[4]
     filled.append(_series(ax, y, 100 * _col(m, "valid_frac"),
                           100 * _col(m, "valid_frac_seed_std"), n_seeds,
-                          C_GRAY, "o", None))
+                          C_GRAY, "left", None))
     _annotate_seed_counts(ax, y, n_seeds)
     ax.set_ylim(0, 112)
     _axis(ax, "Valid ROI [%]")
@@ -133,14 +141,21 @@ def _col(T, name, default=np.nan):
     return np.full(len(T), default, float)
 
 
-def _series(ax, x, v, spread, n_seeds, colour, marker, label):
-    """Draw one metric; returns whether it had anything finite to show."""
-    ax.plot(x, v, f"-{marker}", color=colour, lw=2.0, ms=7, label=label,
-            zorder=3)
+def _series(ax, x, v, spread, n_seeds, colour, slot, label):
+    """Draw one metric as per-slice bars; returns whether anything showed.
+
+    Bars, not a joined line: every slice is an independent stationary
+    acquisition, and a connected line reads as a process evolving (or
+    accumulating) along the vessel, which nothing in the measurement does.
+    slot is 'left'/'right' for a paired series, 'full' for a lone one.
+    """
+    off = {"left": -0.21, "right": 0.21, "full": 0.0}[slot]
+    w = 0.7 if slot == "full" else 0.38
+    ax.bar(x + off, v, width=w, color=colour, label=label, zorder=3)
     ok = (n_seeds > 1) & np.isfinite(v) & np.isfinite(spread)
     if ok.any():
-        ax.errorbar(x[ok], v[ok], spread[ok], fmt="none", ecolor=colour,
-                    elinewidth=1.6, capsize=7, zorder=4)
+        ax.errorbar(x[ok] + off, v[ok], spread[ok], fmt="none",
+                    ecolor="#262626", elinewidth=1.2, capsize=4, zorder=4)
     return bool(np.isfinite(v).any())
 
 

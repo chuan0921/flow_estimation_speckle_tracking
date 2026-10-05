@@ -33,7 +33,7 @@ Figures that show one point per ROI keep a single realisation per slice
 from . import style
 from .cc_peak_map import plot_cc_peak_map
 from .roi_peak import (ZOOMS, lag_error_limit, plot_roi_peak_3x3,
-                       plot_roi_peak_map, roi_peak_frame)
+                       plot_roi_peak_map, roi_peak_frame, velocity_limit)
 from .profile import plot_error_vs_radius, plot_profile
 from .speed_compare import collect_speeds, metric_keys, plot_speed_metric
 from .summary import (plot_bland_altman, plot_bland_altman_slices,
@@ -46,9 +46,9 @@ __all__ = [
     "style", "ZOOMS",
     "plot_profile", "plot_error_vs_radius", "plot_vessel_summary",
     "plot_cc_peak_map", "plot_vector_field",
-    "roi_peak_frame", "lag_error_limit", "plot_roi_peak_map",
+    "roi_peak_frame", "lag_error_limit", "velocity_limit", "plot_roi_peak_map",
     "plot_roi_peak_3x3",
     "plot_nrmse_vs_speed", "plot_valid_fraction", "plot_est_vs_true",
-    "plot_bland_altman", "plot_bland_altman_slices",
+    "plot_bland_altman",
     "collect_speeds", "metric_keys", "plot_speed_metric",
 ]

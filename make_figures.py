@@ -14,10 +14,10 @@ re-rendering never needs MATLAB or a re-run of the estimation.
 from __future__ import annotations
 
 import argparse
-import numpy as np
 import glob
 import os
 
+import numpy as np
 import pandas as pd
 
 import viz
@@ -27,7 +27,7 @@ SUMMARY_DIR = "_summary"
 
 
 def dataset_figures(ds_dir, out_dir=None, title=None, slice_idx=None,
-                    roi_slices=None):
+                    roi_slices=None, no_truth=False, z0=None):
     """Per-dataset figures. Returns the paths written."""
     ds_dir = os.path.abspath(ds_dir)
     out_dir = out_dir or os.path.join(ds_dir, "figures")
@@ -69,13 +69,13 @@ def dataset_figures(ds_dir, out_dir=None, title=None, slice_idx=None,
                 viz.plot_vector_field(Tm, title=f"{title} slice {pick:g}",
                                       truth=True),
                 os.path.join(out_dir, "vector_field.png")))
-        written += roi_peak_figures(P, out_dir, title, roi_slices)
+        written += roi_peak_figures(P, out_dir, title, roi_slices, no_truth, z0)
     if not written:
         print(f"skip: no CSV to plot in {ds_dir}")
     return written
 
 
-def roi_peak_figures(P, out_dir, title, want=None):
+def roi_peak_figures(P, out_dir, title, want=None, no_truth=False, z0=None):
     """Full ROI peak-lag map plus the three 3x3 zooms, per requested slice.
 
     Defaults to one slice per flow segment rather than all of them: the full map
@@ -84,17 +84,19 @@ def roi_peak_figures(P, out_dir, title, want=None):
     Pass want to name the slices instead, for a specific one worth reading.
     """
     written = []
+    color = "velocity" if no_truth else "error"
     for idx in (want if want else _representative_slices(P)):
         d = viz.roi_peak_frame(P, idx)
-        lim = viz.lag_error_limit(d)
+        lim = viz.velocity_limit(d) if no_truth else viz.lag_error_limit(d)
         stem = f"slice_{int(idx):03d}"
         head = f"{title} slice {idx:g}"
         written.append(style.save(
-            viz.plot_roi_peak_map(d, title=head, lim=lim),
+            viz.plot_roi_peak_map(d, title=head, lim=lim, color=color, z0=z0),
             os.path.join(out_dir, "roi_peak", f"{stem}_full.png")))
         for name, target in viz.ZOOMS:
             written.append(style.save(
-                viz.plot_roi_peak_3x3(d, target, name, title=head, lim=lim),
+                viz.plot_roi_peak_3x3(d, target, name, title=head, lim=lim,
+                                      color=color, z0=z0),
                 os.path.join(out_dir, "roi_peak", f"{stem}_3x3_{name}.png")))
     return written
 
@@ -232,6 +234,14 @@ def main():
                     metavar="IDX",
                     help="slice_idx for the ROI peak-lag figures; repeatable. "
                          "Default: one slice per flow segment")
+    ap.add_argument("--z0", type=float, default=None,
+                    help="absolute depth of the vessel centre [mm]; when "
+                         "given, ROI-peak z axes show image depth instead "
+                         "of vessel-centred z")
+    ap.add_argument("--no-truth", action="store_true",
+                    help="experimental data: no ground truth exists, so the "
+                         "ROI peak tiles are coloured by estimated velocity "
+                         "and the true-lag line is dropped")
     args = ap.parse_args()
 
     written = []
@@ -248,14 +258,14 @@ def main():
     path = os.path.abspath(args.path[0])
     if is_dataset_dir(path):
         written += dataset_figures(path, args.outdir, args.title, args.slice,
-                                   args.roi_slice)
+                                   args.roi_slice, args.no_truth, args.z0)
     else:
         for ds in sorted(d for d in glob.glob(os.path.join(path, "*"))
                          if os.path.isdir(d) and is_dataset_dir(d)):
             sub = None if args.outdir is None else os.path.join(
                 args.outdir, os.path.basename(ds))
             written += dataset_figures(ds, sub, args.title, args.slice,
-                                       args.roi_slice)
+                                       args.roi_slice, args.no_truth, args.z0)
         sub = None if args.outdir is None else os.path.join(args.outdir, SUMMARY_DIR)
         written += summary_figures(path, sub, args.title or "")
 
